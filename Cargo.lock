@@ -1407,6 +1407,7 @@ dependencies = [
  "metrics",
  "metrics-exporter-prometheus",
  "ms-ndr",
+ "serde_json",
  "smb-server-auth",
  "smb-server-backend-posix",
  "smb-server-handle-store",

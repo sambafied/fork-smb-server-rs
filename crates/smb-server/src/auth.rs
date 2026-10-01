@@ -1,7 +1,7 @@
 //! Credential verification against the configured user database using the
 //! NTLM family of schemes ([MS-NLMP] §3.3).
 
-use smb_server_auth::crypto::{hmac_md5, nt_hash, ntlmv1_response};
+use smb_server_auth::crypto::{hmac_md5, nt_hash};
 use smb_server_auth::ntlm::Type3;
 use std::collections::HashMap;
 
@@ -47,20 +47,40 @@ pub fn authenticate_ntlmssp(
     if t3.ntlm_response.is_empty() && t3.lm_response.is_empty()
         || t3.flags & smb_server_auth::ntlm::NEGOTIATE_ANONYMOUS != 0
     {
-        return AuthOutcome { ok: true, guest: true, user: "nobody".into(), session_key: NO_KEY };
+        return AuthOutcome {
+            ok: allow_guest,
+            guest: true,
+            user: "nobody".into(),
+            session_key: NO_KEY,
+        };
     }
 
     if users.is_empty() && allow_guest {
         // No user database configured: accept any principal. Without a
         // shared secret the session key cannot be derived.
-        return AuthOutcome { ok: true, guest: false, user, session_key: NO_KEY };
+        return AuthOutcome {
+            ok: true,
+            guest: false,
+            user,
+            session_key: NO_KEY,
+        };
     }
 
     let Some(pass) = users.get(&user.to_lowercase()).cloned() else {
         return if allow_guest {
-            AuthOutcome { ok: true, guest: true, user, session_key: NO_KEY }
+            AuthOutcome {
+                ok: true,
+                guest: true,
+                user,
+                session_key: NO_KEY,
+            }
         } else {
-            AuthOutcome { ok: false, guest: false, user, session_key: NO_KEY }
+            AuthOutcome {
+                ok: false,
+                guest: false,
+                user,
+                session_key: NO_KEY,
+            }
         };
     };
 
@@ -93,19 +113,13 @@ pub fn authenticate_ntlmssp(
         }
     }
 
-    // NTLMv1 fallback: DES-based response over the expanded NT hash. No
-    // session-key derivation here (modern clients always use NTLMv2).
-    if t3.ntlm_response.len() == 24 {
-        let mut h21 = [0u8; 21];
-        h21[..16].copy_from_slice(&nthash);
-        let expect = ntlmv1_response(&h21, challenge);
-        if expect.as_slice() == &t3.ntlm_response[..24] {
-            return AuthOutcome { ok: true, guest: false, user, session_key: NO_KEY };
-        }
-    }
-
     tracing::warn!(user = %user, domain = %t3.domain, ntlm_len = t3.ntlm_response.len(), "ntlm proof mismatch");
-    AuthOutcome { ok: false, guest: false, user, session_key: NO_KEY }
+    AuthOutcome {
+        ok: false,
+        guest: false,
+        user,
+        session_key: NO_KEY,
+    }
 }
 
 /// Exported session key ([MS-NLMP] §3.2.5.1.2):
