@@ -10,10 +10,29 @@ const JOB_LIMIT: usize = 1024;
 pub enum Action {
     Snapshot,
     Reset,
-    Rollback { snapshot_id: String },
-    RestoreTrash { trash_id: String },
-    PurgeTrash { trash_id: String },
-    DeleteSnapshot { snapshot_id: String },
+    Rollback {
+        snapshot_id: String,
+    },
+    RestoreTrash {
+        trash_id: String,
+    },
+    PurgeTrash {
+        trash_id: String,
+    },
+    DeleteSnapshot {
+        snapshot_id: String,
+    },
+    Backup {
+        destination_id: String,
+    },
+    RestoreBackup {
+        destination_id: String,
+        backup_id: String,
+    },
+    DeleteBackup {
+        destination_id: String,
+        backup_id: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -32,6 +51,8 @@ pub struct JobResult {
     pub generation: String,
     pub snapshot_id: Option<String>,
     pub recovery_snapshot_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backup_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -98,16 +119,30 @@ pub struct ActionImpact {
     pub retained_bytes_after: u64,
     pub snapshots_after: usize,
     pub trash_after: usize,
+    pub backups_after: usize,
     pub recovery_retention_seconds: Option<u64>,
     pub physical_reclamation_deferred: bool,
 }
 
 impl Action {
     fn validate(&self) -> Result<()> {
+        match self {
+            Self::Backup { destination_id }
+            | Self::RestoreBackup { destination_id, .. }
+            | Self::DeleteBackup { destination_id, .. }
+                if !super::backup_jobs::destination_id(destination_id) =>
+            {
+                return Err(Error::Path);
+            }
+            _ => {}
+        }
         let source = match self {
-            Self::Snapshot | Self::Reset => return Ok(()),
+            Self::Snapshot | Self::Reset | Self::Backup { .. } => return Ok(()),
             Self::Rollback { snapshot_id } | Self::DeleteSnapshot { snapshot_id } => snapshot_id,
             Self::RestoreTrash { trash_id } | Self::PurgeTrash { trash_id } => trash_id,
+            Self::RestoreBackup { backup_id, .. } | Self::DeleteBackup { backup_id, .. } => {
+                backup_id
+            }
         };
         if Uuid::parse_str(source).is_err() {
             return Err(Error::Path);
@@ -126,7 +161,7 @@ impl Store {
         actor: &str,
         action: Action,
     ) -> Result<ActionImpact> {
-        self.preview_inner(expected, actor, action, false)
+        self.preview_inner(expected, actor, action, false, &BackupCatalog::new())
     }
     pub fn preview_planned_action(
         &self,
@@ -134,7 +169,16 @@ impl Store {
         actor: &str,
         action: Action,
     ) -> Result<ActionImpact> {
-        self.preview_inner(expected, actor, action, true)
+        self.preview_inner(expected, actor, action, true, &BackupCatalog::new())
+    }
+    pub fn preview_planned_action_with_backups(
+        &self,
+        expected: u64,
+        actor: &str,
+        action: Action,
+        catalog: &BackupCatalog,
+    ) -> Result<ActionImpact> {
+        self.preview_inner(expected, actor, action, true, catalog)
     }
     fn preview_inner(
         &self,
@@ -142,6 +186,7 @@ impl Store {
         actor: &str,
         action: Action,
         planned: bool,
+        catalog: &BackupCatalog,
     ) -> Result<ActionImpact> {
         if actor.is_empty() || actor.len() > 256 {
             return Err(Error::Path);
@@ -151,7 +196,7 @@ impl Store {
         let _serial = self.serial()?;
         let original = self.load()?;
         self.revision(&original, expected)?;
-        let fingerprint = digest(&serde_json::to_vec(&(&original, &self.config.policy))?);
+        let fingerprint = self.action_fingerprint(&original, catalog, &action, None)?;
         let mut staged = original.clone();
         match &action {
             Action::Snapshot => {
@@ -175,6 +220,46 @@ impl Store {
             }
             Action::DeleteSnapshot { snapshot_id } => {
                 self.delete_snapshot_locked(&mut staged, snapshot_id, actor)?;
+            }
+            Action::Backup { destination_id } => {
+                let capture = self.prepare_capture(
+                    &staged,
+                    self.destination(catalog, destination_id)?,
+                    &id(),
+                    now(),
+                )?;
+                staged
+                    .backups
+                    .insert(capture.backup.id.clone(), capture.backup.clone());
+                self.event(&mut staged, actor, "backup", None, Some(capture.backup.id))?;
+            }
+            Action::RestoreBackup {
+                destination_id,
+                backup_id,
+            } => {
+                self.restore_backup_prepared(
+                    &mut staged,
+                    self.destination(catalog, destination_id)?,
+                    backup_id,
+                    actor,
+                    false,
+                )?;
+            }
+            Action::DeleteBackup {
+                destination_id,
+                backup_id,
+            } => {
+                let destination = self.destination(catalog, destination_id)?;
+                let backup = self.backup_manifest(destination, backup_id)?;
+                self.check_deletion_budget(destination, &backup, &id())?;
+                staged.backups.remove(backup_id);
+                self.event(
+                    &mut staged,
+                    actor,
+                    "delete-backup",
+                    None,
+                    Some(backup_id.clone()),
+                )?;
             }
         }
         self.check_budget(&staged)?;
@@ -207,12 +292,17 @@ impl Store {
             generation: original.generation,
             base_version: original.identity.base_version,
             fingerprint,
-            recovery_retention_seconds: (matches!(action, Action::Reset | Action::Rollback { .. })
-                || (planned && matches!(action, Action::RestoreTrash { .. })))
+            recovery_retention_seconds: (matches!(
+                action,
+                Action::Reset | Action::Rollback { .. } | Action::RestoreBackup { .. }
+            ) || (planned
+                && matches!(action, Action::RestoreTrash { .. })))
             .then_some(self.config.policy.recovery_protection_seconds),
             physical_reclamation_deferred: matches!(
                 action,
-                Action::PurgeTrash { .. } | Action::DeleteSnapshot { .. }
+                Action::PurgeTrash { .. }
+                    | Action::DeleteSnapshot { .. }
+                    | Action::DeleteBackup { .. }
             ),
             action,
             affected_entries,
@@ -220,6 +310,7 @@ impl Store {
             retained_bytes_after,
             snapshots_after: staged.snapshots.len(),
             trash_after: staged.trash.len(),
+            backups_after: staged.backups.len(),
         })
     }
     /// Submit only after API authorization and preview validation. Matching
@@ -231,7 +322,7 @@ impl Store {
         key: &str,
         action: Action,
     ) -> Result<Submission> {
-        self.submit_inner(expected, actor, key, action, None)
+        self.submit_inner(expected, actor, key, action, None, &BackupCatalog::new())
     }
     /// Check source under the serial lock to close the preview/admission race.
     pub fn submit_planned_job(
@@ -243,7 +334,26 @@ impl Store {
         binding: RequestBinding,
     ) -> Result<Submission> {
         binding.validate()?;
-        self.submit_inner(expected, actor, key, action, Some(binding))
+        self.submit_inner(
+            expected,
+            actor,
+            key,
+            action,
+            Some(binding),
+            &BackupCatalog::new(),
+        )
+    }
+    pub fn submit_planned_job_with_backups(
+        &self,
+        expected: u64,
+        actor: &str,
+        key: &str,
+        action: Action,
+        binding: RequestBinding,
+        catalog: &BackupCatalog,
+    ) -> Result<Submission> {
+        binding.validate()?;
+        self.submit_inner(expected, actor, key, action, Some(binding), catalog)
     }
     fn submit_inner(
         &self,
@@ -252,6 +362,7 @@ impl Store {
         key: &str,
         action: Action,
         binding: Option<RequestBinding>,
+        catalog: &BackupCatalog,
     ) -> Result<Submission> {
         if actor.is_empty() || actor.len() > 256 || key.is_empty() || key.len() > 256 {
             return Err(Error::Path);
@@ -279,7 +390,7 @@ impl Store {
         }
         self.revision(&state, expected)?;
         if let Some(binding) = &binding
-            && digest(&serde_json::to_vec(&(&state, &self.config.policy))?)
+            && self.action_fingerprint(&state, catalog, &action, None)?
                 != binding.source_fingerprint
         {
             return Err(Error::Revision);
@@ -373,6 +484,18 @@ impl Store {
     where
         F: FnMut(&Job) -> Result<()>,
     {
+        self.execute_job_with_backups(job_id, actor, &BackupCatalog::new(), &mut authorize)
+    }
+    pub fn execute_job_with_backups<F>(
+        &self,
+        job_id: &str,
+        actor: &str,
+        catalog: &BackupCatalog,
+        mut authorize: F,
+    ) -> Result<Job>
+    where
+        F: FnMut(&Job) -> Result<()>,
+    {
         let _maintenance = self.maintenance()?;
         let _serial = self.serial()?;
         let mut original = self.load()?;
@@ -388,13 +511,21 @@ impl Store {
             allowed?;
             return Ok(job);
         }
+        // A restarted Running job may have published externally before its
+        // local receipt committed. Keep that uncertainty resumable, including
+        // when fresh authorization or configuration checks reject this retry.
+        let mut external_started = job.status == JobStatus::Running
+            && matches!(
+                job.action,
+                Action::Backup { .. } | Action::DeleteBackup { .. }
+            );
         let operation = (|| {
             allowed?;
             self.revision(&original, job.expected_revision)?;
             if let Some(binding) = &job.request_binding {
                 let mut source = original.clone();
                 source.jobs.remove(job_id);
-                if digest(&serde_json::to_vec(&(&source, &self.config.policy))?)
+                if self.action_fingerprint(&source, catalog, &job.action, Some(job_id))?
                     != binding.source_fingerprint
                 {
                     return Err(Error::Revision);
@@ -411,7 +542,10 @@ impl Store {
                 generation: staged.generation.clone(),
                 snapshot_id: None,
                 recovery_snapshot_id: None,
+                backup_id: None,
             };
+            let mut capture = None;
+            let mut deletion = None;
             match &job.action {
                 Action::Snapshot => {
                     result.snapshot_id = Some(self.snapshot_locked(&mut staged, actor)?)
@@ -436,8 +570,79 @@ impl Store {
                 Action::DeleteSnapshot { snapshot_id } => {
                     self.delete_snapshot_locked(&mut staged, snapshot_id, actor)?
                 }
+                Action::Backup { destination_id } => {
+                    let prepared = self.prepare_capture(
+                        &staged,
+                        self.destination(catalog, destination_id)?,
+                        &job.id,
+                        job.created_at,
+                    )?;
+                    result.backup_id = Some(prepared.backup.id.clone());
+                    staged
+                        .backups
+                        .insert(prepared.backup.id.clone(), prepared.backup.clone());
+                    self.event(
+                        &mut staged,
+                        actor,
+                        "backup",
+                        None,
+                        Some(prepared.backup.id.clone()),
+                    )?;
+                    capture = Some(prepared);
+                }
+                Action::RestoreBackup {
+                    destination_id,
+                    backup_id,
+                } => {
+                    result.backup_id = Some(backup_id.clone());
+                    result.recovery_snapshot_id = Some(self.restore_backup_prepared(
+                        &mut staged,
+                        self.destination(catalog, destination_id)?,
+                        backup_id,
+                        actor,
+                        true,
+                    )?);
+                }
+                Action::DeleteBackup {
+                    destination_id,
+                    backup_id,
+                } => {
+                    let backup = self.backup_manifest_for_job(
+                        self.destination(catalog, destination_id)?,
+                        backup_id,
+                        Some(job_id),
+                    )?;
+                    self.check_deletion_budget(
+                        self.destination(catalog, destination_id)?,
+                        &backup,
+                        job_id,
+                    )?;
+                    staged.backups.remove(backup_id);
+                    self.event(
+                        &mut staged,
+                        actor,
+                        "delete-backup",
+                        None,
+                        Some(backup_id.clone()),
+                    )?;
+                    result.backup_id = Some(backup_id.clone());
+                    deletion = Some((destination_id.clone(), backup));
+                }
             }
+            self.check_budget(&staged)?;
             authorize(&job)?;
+            if let Some(capture) = &capture {
+                external_started = true;
+                self.publish_capture(capture)?;
+            }
+            if let Some((destination_id, backup)) = &deletion {
+                external_started = true;
+                self.publish_backup_deletion(
+                    self.destination(catalog, destination_id)?,
+                    backup,
+                    job_id,
+                )?;
+            }
             result.revision = staged.revision;
             result.generation = staged.generation.clone();
             for event in &mut staged.history[history_start..] {
@@ -463,6 +668,11 @@ impl Store {
                     .filter(|j| j.status == JobStatus::Succeeded)
                 {
                     return Ok(committed.clone());
+                }
+                // A durable external publication must remain resumable under
+                // this job ID, rather than become a terminal failed receipt.
+                if external_started {
+                    return Err(error);
                 }
                 job.status = JobStatus::Failed;
                 job.updated_at = now();

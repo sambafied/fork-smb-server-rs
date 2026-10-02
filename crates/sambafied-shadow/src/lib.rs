@@ -6,7 +6,9 @@
 //! counterpart. The lease works across the API and SMB engine processes.
 #![forbid(unsafe_code)]
 
+mod backup_jobs;
 mod management;
+pub use backup_jobs::BackupCatalog;
 pub use management::{Action, ActionImpact, Job, JobResult, JobStatus, RequestBinding, Submission};
 
 use atomic_write_file::AtomicWriteFile;
@@ -110,7 +112,8 @@ pub struct Config {
 
 /// Only server configuration supplies destination paths. Management requests
 /// select `id`; a caller-provided filesystem path is never a destination.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BackupDestination {
     pub id: String,
     pub root: PathBuf,
@@ -408,15 +411,15 @@ impl Store {
         let _serial = store.serial()?;
         if store.state_path().exists() {
             let mut state = store.load()?;
-            if state.schema < 3 {
+            if state.schema < 4 {
                 let _maintenance = store.maintenance()?;
-                state.schema = 3;
+                state.schema = 4;
                 store.save(&state)?;
             }
             store.collect_blobs(&state)?;
         } else {
             store.save(&State {
-                schema: 3,
+                schema: 4,
                 identity: store.config.identity.clone(),
                 base_digest: store.base_digest.clone(),
                 generation: id(),
@@ -451,13 +454,25 @@ impl Store {
     fn load(&self) -> Result<State> {
         let state: State =
             serde_json::from_slice(&bounded_read(&self.state_path(), 16 * 1024 * 1024)?)?;
-        if !matches!(state.schema, 1..=3)
+        if !matches!(state.schema, 1..=4)
             || (state.schema == 1 && !state.jobs.is_empty())
             || state.jobs.values().any(|job| {
-                job.request_binding
-                    .as_ref()
-                    .is_some_and(|binding| state.schema < 3 || binding.validate().is_err())
+                (state.schema < 4
+                    && (matches!(
+                        job.action,
+                        Action::Backup { .. }
+                            | Action::RestoreBackup { .. }
+                            | Action::DeleteBackup { .. }
+                    ) || job
+                        .result
+                        .as_ref()
+                        .is_some_and(|result| result.backup_id.is_some())))
+                    || job
+                        .request_binding
+                        .as_ref()
+                        .is_some_and(|binding| state.schema < 3 || binding.validate().is_err())
             })
+            || (state.schema < 4 && state.backups.values().any(|backup| backup.schema > 1))
             || state.identity != self.config.identity
             || state.base_digest != self.base_digest
         {
@@ -1164,7 +1179,12 @@ impl Store {
             return Err(Error::Path);
         }
         let namespace = root.join(self.namespace.file_name().ok_or(Error::Path)?);
-        fs::create_dir_all(&namespace)?;
+        if namespace.exists() {
+            let metadata = fs::symlink_metadata(&namespace)?;
+            if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                return Err(Error::Path);
+            }
+        }
         Ok(namespace)
     }
     /// Capture a quiescent shadow-only backup. Base files are references, not
@@ -1181,6 +1201,7 @@ impl Store {
         self.revision(&state, expected)?;
         self.verify_view(&state.view)?;
         let namespace = self.backup_namespace(destination)?;
+        fs::create_dir_all(&namespace)?;
         // Count incomplete captures as well: interrupted staging cannot provide
         // unlimited storage outside the declared backup budget.
         let existing: Vec<_> = fs::read_dir(&namespace)?.collect::<std::io::Result<_>>()?;
@@ -1258,6 +1279,9 @@ impl Store {
         let _serial = self.serial()?;
         let namespace = self.backup_namespace(destination)?;
         let mut backups = Vec::new();
+        if !namespace.exists() {
+            return Ok(backups);
+        }
         for entry in fs::read_dir(namespace)? {
             let entry = entry?;
             if !entry.file_type()?.is_dir()
@@ -1266,6 +1290,10 @@ impl Store {
                 return Err(Error::Corrupt);
             }
             let path = entry.path().join("manifest.json");
+            if entry.path().join("deleted.json").exists() {
+                self.backup_deletion(destination, &entry.file_name().to_string_lossy())?;
+                continue;
+            }
             if !path.exists() {
                 continue;
             }
@@ -1275,16 +1303,40 @@ impl Store {
         Ok(backups)
     }
     fn backup_manifest(&self, destination: &BackupDestination, backup_id: &str) -> Result<Backup> {
+        self.backup_manifest_for_job(destination, backup_id, None)
+    }
+    fn backup_manifest_for_job(
+        &self,
+        destination: &BackupDestination,
+        backup_id: &str,
+        deleting_job: Option<&str>,
+    ) -> Result<Backup> {
         let parsed = Uuid::parse_str(backup_id).map_err(|_| Error::Path)?;
         if parsed.to_string() != backup_id {
             return Err(Error::Path);
         }
         let namespace = self.backup_namespace(destination)?;
+        let path = namespace.join(backup_id);
+        let metadata = fs::symlink_metadata(&path).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                Error::NotFound
+            } else {
+                Error::Io(error)
+            }
+        })?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(Error::Path);
+        }
+        if let Some(deleted) = self.backup_deletion(destination, backup_id)?
+            && deleting_job != Some(deleted.job_id.as_str())
+        {
+            return Err(Error::NotFound);
+        }
         let backup: Backup = serde_json::from_slice(&bounded_read(
             &namespace.join(backup_id).join("manifest.json"),
             16 * 1024 * 1024,
         )?)?;
-        if backup.schema != 1
+        if !matches!(backup.schema, 1..=2)
             || backup.identity != self.config.identity
             || backup.base_digest != self.base_digest
             || backup.id != backup_id
@@ -1305,16 +1357,18 @@ impl Store {
         let _serial = self.serial()?;
         let mut state = self.load()?;
         self.revision(&state, expected)?;
-        let result = self.restore_backup_locked(&mut state, destination, backup_id, actor)?;
+        let result =
+            self.restore_backup_prepared(&mut state, destination, backup_id, actor, true)?;
         self.save(&state)?;
         Ok(result)
     }
-    fn restore_backup_locked(
+    fn restore_backup_prepared(
         &self,
         state: &mut State,
         destination: &BackupDestination,
         backup_id: &str,
         actor: &str,
+        write_blobs: bool,
     ) -> Result<String> {
         let backup = self.backup_manifest(destination, backup_id)?;
         if backup.expires_at <= now() {
@@ -1367,8 +1421,10 @@ impl Store {
             Some(backup_id.to_string()),
         )?;
         self.check_budget(state)?;
-        for bytes in payload.values() {
-            self.put_blob(bytes)?;
+        if write_blobs {
+            for bytes in payload.values() {
+                self.put_blob(bytes)?;
+            }
         }
         Ok(recovery)
     }
