@@ -7,8 +7,10 @@
 #![forbid(unsafe_code)]
 
 mod backup_jobs;
+mod export;
 mod management;
 pub use backup_jobs::BackupCatalog;
+pub use export::{ExportManifest, ExportSummary};
 pub use management::{Action, ActionImpact, Job, JobResult, JobStatus, RequestBinding, Submission};
 
 use atomic_write_file::AtomicWriteFile;
