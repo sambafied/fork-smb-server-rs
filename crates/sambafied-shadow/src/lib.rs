@@ -7,7 +7,7 @@
 #![forbid(unsafe_code)]
 
 mod management;
-pub use management::{Action, Job, JobResult, JobStatus, Submission};
+pub use management::{Action, ActionImpact, Job, JobResult, JobStatus, Submission};
 
 use atomic_write_file::AtomicWriteFile;
 use serde::{Deserialize, Serialize};
@@ -1019,6 +1019,16 @@ impl Store {
         Ok(())
     }
     fn restore_trash_locked(&self, state: &mut State, trash_id: &str, actor: &str) -> Result<()> {
+        self.restore_trash_prepared(state, trash_id, actor, true)
+    }
+    // Preview shares restore validation but never publishes content or a manifest.
+    fn restore_trash_prepared(
+        &self,
+        state: &mut State,
+        trash_id: &str,
+        actor: &str,
+        publish: bool,
+    ) -> Result<()> {
         let trash = state.trash.get(trash_id).cloned().ok_or(Error::NotFound)?;
         if trash.expires_at <= now() {
             return Err(Error::Retention);
@@ -1043,7 +1053,25 @@ impl Store {
                     ..state.clone()
                 };
                 let bytes = self.bytes(&pinned, &trash.path)?;
-                self.publish_file(state, &trash.path, &bytes)?;
+                if publish {
+                    self.publish_file(state, &trash.path, &bytes)?;
+                } else {
+                    if bytes.len() as u64 > self.config.policy.temporary_bytes {
+                        return Err(Error::Quota);
+                    }
+                    let blob = self.blob_path(&digest(&bytes))?;
+                    if blob.exists()
+                        && digest(&bounded_read(&blob, self.config.policy.max_file_bytes)?)
+                            != digest(&bytes)
+                    {
+                        return Err(Error::Corrupt);
+                    }
+                    state
+                        .view
+                        .upper
+                        .insert(trash.path.clone(), trash.entry.clone());
+                    self.check_budget(state)?;
+                }
                 state
                     .view
                     .upper

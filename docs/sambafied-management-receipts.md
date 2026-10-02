@@ -1,8 +1,8 @@
 # Sambafied management receipts
 
 Management receipts are durable, internal core-job primitives. They are not a
-public management API and do not by themselves provide a CLI, UI, previews,
-backup jobs or exports. Retention and receipt pruning are also pending.
+public management API and do not by themselves provide a CLI, UI, backup jobs
+or exports. Retention and receipt pruning are also pending.
 
 ## Supported operations
 
@@ -14,6 +14,52 @@ Each receipt names exactly one of these six operations:
 4. `restore-trash` of a trash entry
 5. `purge-trash` of a trash entry
 6. `delete-snapshot` of a snapshot
+
+## Action previews
+
+`preview_action` is an internal, pure preflight for those same six actions. It
+obtains the exclusive maintenance gate and is blocked while another maintenance
+operation holds it. It also serializes with state access, requires the caller's
+expected revision, validates the action, and evaluates the operation against a
+staged clone of the current state. A busy gate, stale revision, malformed
+identifier, retention protection, quota failure, or any other operation
+precondition prevents a preview from being returned.
+
+The returned `ActionImpact` binds the evidence to the current revision,
+generation, base version, and a fingerprint of the state and policy. It reports
+the logical post-action usage and counts: active and retained bytes, snapshot
+and trash counts, and the number of affected entries. `affected_entries` is
+calculated against the merged namespace, including base and upper-layer paths,
+so it represents the logical visible change rather than only a copied-up file.
+For `reset` and `rollback`, `recovery_retention_seconds` reports the configured
+recovery window. It is not a generalized retention forecast. For `purge-trash`
+and `delete-snapshot`, `physical_reclamation_deferred` says that later physical
+reclamation may still be required; the preview does not promise reclaimed disk
+space.
+
+Previewing writes no blob, manifest, receipt, history event, or job. This also
+holds for a base-only trash restore: preview validates the copy-up and budget
+path without materializing the file's blob. It changes neither the stored state
+nor the namespace visible to SMB clients.
+
+A preview is evidence, not authorization, a durable plan, or a public API
+contract. Before requesting a preview, an API caller must authorize the action
+and bind its result to the actor, resource, normalized input, expiry, and its
+own plan identifier. The fingerprint is not an authorization decision and must
+not be treated as a durable plan token. Submission and execution must acquire
+their own gates and recheck every authorization and state precondition; a
+successful preview does not reserve the namespace or guarantee execution.
+
+The impact is a logical storage estimate. It does not guarantee physical free
+space, concrete blob or object keys, encryption state, ACLs, aliases, or other
+filesystem-facing details.
+
+The receipt test suite currently has 12 receipt cases, including four preview
+regressions: all six actions leave storage unchanged while reset reports its
+recovery window; base-only restore does not materialize a blob; preview rejects
+busy, stale-revision, protected-source, and restore-conflict cases without
+writes; and fingerprint changes with its source state while reset still checks
+the recovery quota.
 
 On success, the operation's data change, its resulting receipt, and all history
 events created by that operation are atomically published together. The receipt
