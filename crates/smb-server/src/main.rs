@@ -53,6 +53,10 @@ struct Args {
     #[arg(long)]
     shadow_config: Option<std::path::PathBuf>,
 
+    /// Existing server-owned directory for durable shared shadow policy.
+    #[arg(long, requires = "shadow_config")]
+    shadow_policy_root: Option<std::path::PathBuf>,
+
     /// Log filter (tracing EnvFilter syntax); RUST_LOG overrides this value.
     #[arg(long = "log", default_value = "info")]
     log_filter: String,
@@ -111,7 +115,14 @@ fn main() {
     let users = build_users(&args);
     let mut share_map = build_shares(&args);
     if let Some(path) = &args.shadow_config {
-        if apply_shadows(&mut share_map, &users, path).is_err() {
+        if apply_shadows(
+            &mut share_map,
+            &users,
+            path,
+            args.shadow_policy_root.as_deref(),
+        )
+        .is_err()
+        {
             eprintln!("Invalid private shadow configuration");
             std::process::exit(2);
         }
@@ -270,6 +281,7 @@ fn apply_shadows(
     shares: &mut HashMap<String, state::Share>,
     users: &HashMap<String, String>,
     path: &std::path::Path,
+    policy_root: Option<&std::path::Path>,
 ) -> Result<(), ()> {
     let metadata = std::fs::symlink_metadata(path).map_err(|_| ())?;
     if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > 16 * 1024 * 1024
@@ -305,9 +317,9 @@ fn apply_shadows(
         let mut identities = std::collections::HashSet::new();
         let base = std::fs::canonicalize(&share.root).map_err(|_| ())?;
         let mut scope = None;
-        for (username, config) in principals {
-            if username != username.to_lowercase()
-                || !users.contains_key(&username)
+        for (username, config) in &principals {
+            if username.as_str() != username.to_lowercase()
+                || !users.contains_key(username)
                 || std::fs::canonicalize(&config.base).map_err(|_| ())? != base
                 || !identities.insert(config.identity.principal.clone())
                 || !namespaces.insert((
@@ -331,13 +343,53 @@ fn apply_shadows(
                 return Err(());
             }
             scope = Some(identity_scope);
-            let vfs = smb_server_backend_shadow::ShadowVfs::new(config).map_err(|_| ())?;
+        }
+        // Validate every initial share policy before publishing a catalogue. A
+        // shared authority cannot silently select one user's startup defaults.
+        let catalog = match policy_root {
+            Some(root) => Some(open_share_policy(root, &principals)?),
+            None => None,
+        };
+        for (username, config) in principals {
+            let vfs = match &catalog {
+                Some(catalog) => smb_server_backend_shadow::ShadowVfs::new_with_policy_catalog(
+                    config,
+                    catalog.clone(),
+                ),
+                None => smb_server_backend_shadow::ShadowVfs::new(config),
+            }
+            .map_err(|_| ())?;
             map.insert(username, Arc::new(vfs));
         }
         share.vfs = Arc::new(smb_server_backend_shadow::UnmappedVfs);
         share.principal_vfs = Some(Arc::new(map));
     }
     Ok(())
+}
+
+/// Validate a single share authority before creating its durable document.
+fn open_share_policy(
+    root: &std::path::Path,
+    principals: &std::collections::BTreeMap<String, sambafied_shadow::Config>,
+) -> Result<sambafied_shadow::SharePolicyCatalog, ()> {
+    let first = principals.values().next().ok_or(())?;
+    let initial = serde_json::to_vec(&first.policy).map_err(|_| ())?;
+    for config in principals.values() {
+        if config.identity.organization != first.identity.organization
+            || config.identity.share != first.identity.share
+            || config.identity.base_version != first.identity.base_version
+            || serde_json::to_vec(&config.policy).map_err(|_| ())? != initial
+        {
+            return Err(());
+        }
+    }
+    sambafied_shadow::SharePolicyCatalog::open(
+        root,
+        &first.identity.organization,
+        &first.identity.share,
+        first.policy.clone(),
+    )
+    .map_err(|_| ())
 }
 
 /// Parse account JSON received through the private stdin channel.
@@ -387,7 +439,86 @@ fn parse_users(raw: &str) -> Result<HashMap<String, String>, ()> {
 
 #[cfg(test)]
 mod sambafied_tests {
-    use super::parse_users;
+    use super::{open_share_policy, parse_users, Args};
+    use clap::Parser;
+
+    fn shadow_config(root: &std::path::Path, principal: &str) -> sambafied_shadow::Config {
+        sambafied_shadow::Config {
+            root: root.join("upper"),
+            base: root.join("base"),
+            identity: sambafied_shadow::Identity {
+                organization: "org".into(),
+                share: "games".into(),
+                principal: principal.into(),
+                base_version: "v1".into(),
+            },
+            policy: sambafied_shadow::Policy {
+                active_bytes: 4096,
+                active_files: 20,
+                retained_bytes: 8192,
+                temporary_bytes: 2048,
+                max_file_bytes: 1024,
+                snapshot_limit: 20,
+                history_limit: 100,
+                snapshot_ttl_seconds: 3600,
+                recovery_protection_seconds: 300,
+                trash_ttl_seconds: 3600,
+                artifacts: None,
+            },
+        }
+    }
+
+    #[test]
+    fn shared_policy_rejects_conflicting_defaults_before_publication() {
+        let temp = tempfile::tempdir().unwrap();
+        let alice = shadow_config(temp.path(), "alice");
+        let mut bob = shadow_config(temp.path(), "bob");
+        bob.policy.active_bytes = 2048;
+        let mut principals = std::collections::BTreeMap::from([
+            ("alice".into(), alice.clone()),
+            ("bob".into(), bob.clone()),
+        ]);
+        assert!(open_share_policy(temp.path(), &principals).is_err());
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
+        bob.policy = alice.policy.clone();
+        bob.identity.organization = "other-org".into();
+        principals.insert("bob".into(), bob);
+        assert!(open_share_policy(temp.path(), &principals).is_err());
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn shared_policy_startup_preserves_committed_edit() {
+        let temp = tempfile::tempdir().unwrap();
+        let alice = shadow_config(temp.path(), "alice");
+        let principals = std::collections::BTreeMap::from([
+            ("alice".into(), alice.clone()),
+            ("bob".into(), shadow_config(temp.path(), "bob")),
+        ]);
+        let catalog = open_share_policy(temp.path(), &principals).unwrap();
+        let mut updated = alice.policy;
+        updated.max_file_bytes = 8;
+        catalog.replace(0, "admin", updated).unwrap();
+        let reopened = open_share_policy(temp.path(), &principals).unwrap();
+        let read = reopened.read().unwrap();
+        assert_eq!(read.document().revision, 1);
+        assert_eq!(read.document().policy.max_file_bytes, 8);
+        assert_eq!(read.document().changes.len(), 1);
+    }
+
+    #[test]
+    fn policy_root_requires_explicit_shadow_configuration() {
+        assert!(Args::try_parse_from([
+            "rustsmb",
+            "--users-stdin",
+            "--share",
+            "games=/games",
+            "--shadow-policy-root",
+            "/policies",
+        ])
+        .is_err());
+    }
+
     #[test]
     fn explicit_accounts_are_bounded_and_case_unique() {
         assert!(parse_users("{}").is_err());
