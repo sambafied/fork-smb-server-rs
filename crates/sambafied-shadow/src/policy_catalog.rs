@@ -26,6 +26,36 @@ pub struct PolicyChange {
     pub policy_digest: String,
 }
 
+/// Last explicitly acknowledged archive, anchoring the remaining event chain.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PolicyCheckpoint {
+    pub revision: u64,
+    pub actor: String,
+    pub acknowledged_at: u64,
+    pub policy_digest: String,
+    pub batch_digest: String,
+    pub previous_checkpoint_digest: Option<String>,
+}
+
+/// Portable bounded audit batch. Its canonical JSON digest is the audit ETag.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PolicyAuditBatch {
+    pub schema: u32,
+    pub organization: String,
+    pub share: String,
+    pub revision: u64,
+    pub policy_digest: String,
+    pub checkpoint: Option<PolicyCheckpoint>,
+    pub changes: Vec<PolicyChange>,
+}
+impl PolicyAuditBatch {
+    pub fn fingerprint(&self) -> Result<String> {
+        Ok(digest(&serde_json::to_vec(self)?))
+    }
+}
+
 /// Versioned authority for one organisation/share. No upper data is stored here.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -42,6 +72,9 @@ pub struct PolicyDocument {
     pub policy: Policy,
     /// Durable administrative outbox. A full outbox rejects further changes.
     pub changes: Vec<PolicyChange>,
+    /// Absent in schema 1. Schema 2 requires an explicit archive acknowledgement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<PolicyCheckpoint>,
 }
 
 /// A consistent policy document protected against concurrent replacement.
@@ -54,6 +87,10 @@ impl PolicyRead {
     /// Borrow the policy while retaining its cross-process read lease.
     pub fn document(&self) -> &PolicyDocument {
         &self.document
+    }
+
+    pub fn audit_batch(&self) -> Result<PolicyAuditBatch> {
+        batch(&self.document)
     }
 
     /// Bind previews to scope, policy values and monotonic revision, preventing ABA.
@@ -111,6 +148,7 @@ impl SharePolicyCatalog {
                         revision: 0,
                         policy: initial,
                         changes: Vec::new(),
+                        checkpoint: None,
                     },
                 )?;
             }
@@ -161,6 +199,46 @@ impl SharePolicyCatalog {
         Ok(document)
     }
 
+    /// Release only the exact exported batch after explicit external archival
+    /// acknowledgement. Policy values/revision and storage data are untouched.
+    pub fn acknowledge(
+        &self,
+        expected_digest: &str,
+        through_revision: u64,
+        actor: &str,
+    ) -> Result<PolicyDocument> {
+        if !valid_digest(expected_digest) || !valid_actor(actor) {
+            return Err(Error::Path);
+        }
+        let _lease = self.exclusive(true)?;
+        let mut document = self.load()?;
+        if document.revision != through_revision
+            || batch(&document)?.fingerprint()? != expected_digest
+        {
+            return Err(Error::Revision);
+        }
+        if document.changes.is_empty() {
+            return Err(Error::Path);
+        }
+        let previous_checkpoint_digest = document
+            .checkpoint
+            .as_ref()
+            .map(|checkpoint| serde_json::to_vec(checkpoint).map(|bytes| digest(&bytes)))
+            .transpose()?;
+        document.checkpoint = Some(PolicyCheckpoint {
+            revision: document.revision,
+            actor: actor.into(),
+            acknowledged_at: now(),
+            policy_digest: policy_digest(&document.policy)?,
+            batch_digest: expected_digest.into(),
+            previous_checkpoint_digest,
+        });
+        document.schema = 2;
+        document.changes.clear();
+        atomic_json(&self.document_path, &document)?;
+        Ok(document)
+    }
+
     fn exclusive(&self, nonblocking: bool) -> Result<Lease> {
         self.validate_lock()?;
         lock(&self.lock_path, true, nonblocking)
@@ -178,18 +256,39 @@ impl SharePolicyCatalog {
     fn load(&self) -> Result<PolicyDocument> {
         let document: PolicyDocument =
             serde_json::from_slice(&bounded_read(&self.document_path, MAX_DOCUMENT_BYTES)?)?;
-        if document.schema != 1
+        if !matches!(document.schema, 1 | 2)
             || document.organization != self.organization
             || document.share != self.share
             || document.changes.len() > MAX_CHANGES
-            || document.revision != document.changes.len() as u64
         {
             return Err(Error::Corrupt);
         }
         document.policy.validate().map_err(|_| Error::Corrupt)?;
-        let mut previous = None;
+        let anchor = match (document.schema, &document.checkpoint) {
+            (1, None) => 0,
+            (2, Some(checkpoint))
+                if checkpoint.revision > 0
+                    && valid_actor(&checkpoint.actor)
+                    && valid_digest(&checkpoint.policy_digest)
+                    && valid_digest(&checkpoint.batch_digest)
+                    && checkpoint
+                        .previous_checkpoint_digest
+                        .as_ref()
+                        .is_none_or(|value| valid_digest(value)) =>
+            {
+                checkpoint.revision
+            }
+            _ => return Err(Error::Corrupt),
+        };
+        if anchor.checked_add(document.changes.len() as u64) != Some(document.revision) {
+            return Err(Error::Corrupt);
+        }
+        let mut previous = document
+            .checkpoint
+            .as_ref()
+            .map(|checkpoint| &checkpoint.policy_digest);
         for (index, change) in document.changes.iter().enumerate() {
-            if change.revision != index as u64 + 1
+            if change.revision != anchor + index as u64 + 1
                 || !valid_actor(&change.actor)
                 || !valid_digest(&change.previous_digest)
                 || !valid_digest(&change.policy_digest)
@@ -205,6 +304,17 @@ impl SharePolicyCatalog {
         }
         Ok(document)
     }
+}
+fn batch(document: &PolicyDocument) -> Result<PolicyAuditBatch> {
+    Ok(PolicyAuditBatch {
+        schema: 1,
+        organization: document.organization.clone(),
+        share: document.share.clone(),
+        revision: document.revision,
+        policy_digest: policy_digest(&document.policy)?,
+        checkpoint: document.checkpoint.clone(),
+        changes: document.changes.clone(),
+    })
 }
 fn policy_digest(policy: &Policy) -> Result<String> {
     Ok(digest(&serde_json::to_vec(policy)?))
