@@ -239,6 +239,15 @@ pub struct Lease {
     _file: File,
 }
 
+impl Drop for Lease {
+    fn drop(&mut self) {
+        // Release ownership explicitly: a concurrent Unix process spawn can
+        // briefly inherit the open file description before close-on-exec.
+        // Merely closing our descriptor can then leave its lock behind.
+        let _ = self._file.unlock();
+    }
+}
+
 #[derive(Debug)]
 pub struct Handle {
     pub store: Arc<Store>,
