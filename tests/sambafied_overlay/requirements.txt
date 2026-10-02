@@ -1,0 +1,3 @@
+# Kept separate from tests/smoke because this actuator exercises the future
+# two-user overlay contract, rather than the first-milestone server smoke.
+smbprotocol==1.15.0

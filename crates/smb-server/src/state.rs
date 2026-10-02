@@ -42,6 +42,8 @@ pub struct Share {
     pub root: PathBuf,
     /// Backend serving this share.
     pub vfs: Arc<dyn Vfs>,
+    /// Private authenticated-account mapping with no common-backend fallback.
+    pub principal_vfs: Option<Arc<HashMap<String, Arc<dyn Vfs>>>>,
     /// True for the virtual `IPC$` pipe share.
     pub is_ipc: bool,
     /// True when the share requires SMB3 encryption (SMB2_SHAREFLAG_ENCRYPT_DATA):

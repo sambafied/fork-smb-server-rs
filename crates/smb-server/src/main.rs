@@ -49,6 +49,10 @@ struct Args {
     #[arg(short = 's', long = "share", value_name = "NAME=PATH", required = true)]
     shares: Vec<String>,
 
+    /// Server-owned private shadow configuration. Passwords stay on stdin.
+    #[arg(long)]
+    shadow_config: Option<std::path::PathBuf>,
+
     /// Log filter (tracing EnvFilter syntax); RUST_LOG overrides this value.
     #[arg(long = "log", default_value = "info")]
     log_filter: String,
@@ -104,8 +108,18 @@ fn main() {
         .with_target(false)
         .init();
 
-    let share_map = build_shares(&args);
     let users = build_users(&args);
+    let mut share_map = build_shares(&args);
+    if let Some(path) = &args.shadow_config {
+        if apply_shadows(&mut share_map, &users, path).is_err() {
+            eprintln!("Invalid private shadow configuration");
+            std::process::exit(2);
+        }
+        if args.handle_store != "mem" {
+            eprintln!("Persistent SMB handles are not qualified for shadow shares");
+            std::process::exit(2);
+        }
+    }
 
     let guid = random_guid();
     let shared = Arc::new(state::ServerShared {
@@ -227,6 +241,7 @@ fn build_shares(args: &Args) -> HashMap<String, state::Share> {
                 name,
                 root: root.into(),
                 vfs,
+                principal_vfs: None,
                 is_ipc: false,
                 encrypt,
                 compress,
@@ -241,6 +256,7 @@ fn build_shares(args: &Args) -> HashMap<String, state::Share> {
             name: "IPC$".into(),
             root: "/".into(),
             vfs: Arc::new(smb_server_backend_posix::PosixVfs::new("/")),
+            principal_vfs: None,
             is_ipc: true,
             encrypt: false,
             compress: false,
@@ -248,6 +264,80 @@ fn build_shares(args: &Args) -> HashMap<String, state::Share> {
         },
     );
     map
+}
+
+fn apply_shadows(
+    shares: &mut HashMap<String, state::Share>,
+    users: &HashMap<String, String>,
+    path: &std::path::Path,
+) -> Result<(), ()> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|_| ())?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > 16 * 1024 * 1024
+    {
+        return Err(());
+    }
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .map_err(|_| ())?
+        .take(16 * 1024 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| ())?;
+    if bytes.len() > 16 * 1024 * 1024 {
+        return Err(());
+    }
+    let configs: std::collections::BTreeMap<
+        String,
+        std::collections::BTreeMap<String, sambafied_shadow::Config>,
+    > = serde_json::from_slice(&bytes).map_err(|_| ())?;
+    if configs.is_empty() {
+        return Err(());
+    }
+    let mut namespaces = std::collections::HashSet::new();
+    for (name, principals) in configs {
+        if name != name.to_lowercase() || principals.is_empty() {
+            return Err(());
+        }
+        let share = shares.get_mut(&name).ok_or(())?;
+        if share.is_ipc || share.ca {
+            return Err(());
+        }
+        let mut map: HashMap<String, Arc<dyn smb_server_vfs::Vfs>> = HashMap::new();
+        let mut identities = std::collections::HashSet::new();
+        let base = std::fs::canonicalize(&share.root).map_err(|_| ())?;
+        let mut scope = None;
+        for (username, config) in principals {
+            if username != username.to_lowercase()
+                || !users.contains_key(&username)
+                || std::fs::canonicalize(&config.base).map_err(|_| ())? != base
+                || !identities.insert(config.identity.principal.clone())
+                || !namespaces.insert((
+                    config.identity.organization.clone(),
+                    config.identity.share.clone(),
+                    config.identity.principal.clone(),
+                    config.identity.base_version.clone(),
+                ))
+            {
+                return Err(());
+            }
+            let identity_scope = (
+                config.identity.organization.clone(),
+                config.identity.share.clone(),
+                config.identity.base_version.clone(),
+            );
+            if scope
+                .as_ref()
+                .is_some_and(|expected| expected != &identity_scope)
+            {
+                return Err(());
+            }
+            scope = Some(identity_scope);
+            let vfs = smb_server_backend_shadow::ShadowVfs::new(config).map_err(|_| ())?;
+            map.insert(username, Arc::new(vfs));
+        }
+        share.vfs = Arc::new(smb_server_backend_shadow::UnmappedVfs);
+        share.principal_vfs = Some(Arc::new(map));
+    }
+    Ok(())
 }
 
 /// Parse account JSON received through the private stdin channel.

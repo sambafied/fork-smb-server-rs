@@ -2304,7 +2304,7 @@ pub(crate) fn session_setup(
 #[cfg_attr(dylint_lib = "no_magic_numbers", allow(no_magic_numbers))] // SMB2 wire serialization
 pub(crate) fn tree_connect(
     server: &Arc<ServerShared>,
-    _conn: &mut Smb2Conn,
+    conn: &mut Smb2Conn,
     buf: &[u8],
 ) -> Result<(String, u8, bool, bool, bool), Status> {
     let path_len = g16(buf, c::tcon_off::PATH_LENGTH) as usize;
@@ -2323,6 +2323,12 @@ pub(crate) fn tree_connect(
         .unwrap_or("")
         .to_lowercase();
     let share = server.shares.get(&name).ok_or(Status::BAD_NETWORK_NAME)?;
+    if let Some(principals) = &share.principal_vfs {
+        if !conn.authenticated || conn.guest || !principals.contains_key(&conn.user.to_lowercase())
+        {
+            return Err(Status::ACCESS_DENIED);
+        }
+    }
     let share_type = if share.is_ipc {
         c::share_type::PIPE
     } else {
@@ -2333,6 +2339,49 @@ pub(crate) fn tree_connect(
 
 // ---------------- CREATE ----------------
 
+/// A reservation remains owned by this request until its handle is installed.
+/// Dropped/cancelled storage work releases the reservation before returning.
+struct ShadowOpenReservation {
+    modes: Arc<crate::state::ShareModeTable>,
+    owner: crate::state::LockOwner,
+    access: u32,
+    share: u32,
+    path: std::sync::Mutex<Option<String>>,
+    committed: std::sync::atomic::AtomicBool,
+}
+impl ShadowOpenReservation {
+    fn reserve(&self, path: &str) -> smb_server_vfs::VfsResult<()> {
+        let mut reserved = self
+            .path
+            .lock()
+            .map_err(|_| smb_server_vfs::VfsError::AccessDenied)?;
+        if reserved.is_some() {
+            return Err(smb_server_vfs::VfsError::InvalidArgument);
+        }
+        if !self
+            .modes
+            .try_open(path, self.access, self.share, self.owner)
+        {
+            return Err(smb_server_vfs::VfsError::SharingViolation);
+        }
+        *reserved = Some(path.to_string());
+        Ok(())
+    }
+}
+impl Drop for ShadowOpenReservation {
+    fn drop(&mut self) {
+        if !self.committed.load(Ordering::Acquire) {
+            if let Ok(path) = self.path.lock() {
+                if let Some(path) = path.as_ref() {
+                    self.modes.close(path, self.owner);
+                }
+            }
+        }
+    }
+}
+
+
+
 #[cfg_attr(dylint_lib = "no_magic_numbers", allow(no_magic_numbers))] // SMB2 wire serialization
 pub(crate) async fn create(
     conn: &mut Smb2Conn,
@@ -2342,7 +2391,19 @@ pub(crate) async fn create(
     is_ca: bool,
     buf: &[u8],
 ) -> Result<Vec<u8>, Status> {
-    let req = c::CreateReq::parse(buf).ok_or(Status::INVALID_PARAMETER)?;
+    let mut req = c::CreateReq::parse(buf).ok_or(Status::INVALID_PARAMETER)?;
+    let atomic = vfs.atomic_open_checks();
+    if atomic {
+        if durable_reconnect_ids(&req.durable).is_some() || req.app_instance_id.is_some() {
+            return Err(Status::NOT_IMPLEMENTED);
+        }
+        // These optional caching/durability grants are withheld until their
+        // private-generation semantics are qualified. Plain opens still work.
+        req.durable = None;
+        req.durable_ctx_tags = 0;
+        req.lease = None;
+        req.oplock_level = c::oplock::NONE;
+    }
 
     const OPT_DIRECTORY_FILE: u32 = 0x1;
     const OPT_NON_DIRECTORY_FILE: u32 = 0x40;
@@ -2384,12 +2445,37 @@ pub(crate) async fn create(
         && list
             .iter()
             .any(|r| r.path == rel && r.flags & c::durable::FLAG_PERSISTENT != 0)
-        {
-            return Err(Status::FILE_NOT_AVAILABLE);
-        }
+    {
+        return Err(Status::FILE_NOT_AVAILABLE);
+    }
 
-    let (mut open, meta, action) = match vfs
-        .create(
+    let fid_bytes = next_file_id();
+    let reservation = atomic.then(|| {
+        Arc::new(ShadowOpenReservation {
+            modes: server.share_modes.clone(),
+            owner: (conn.session_id, fid_bytes),
+            access: req.desired_access,
+            share: req.share_access,
+            path: std::sync::Mutex::new(None),
+            committed: std::sync::atomic::AtomicBool::new(false),
+        })
+    });
+    let created = if let Some(reservation) = &reservation {
+        let reservation = reservation.clone();
+        vfs.create_checked(
+            smb_server_vfs::CreateArgs {
+                rel: &rel,
+                is_dir: want_dir,
+                access: req.desired_access,
+                disposition: req.disposition,
+                options: req.options,
+                attrs: req.attrs,
+            },
+            Arc::new(move |path| reservation.reserve(path)),
+        )
+        .await
+    } else {
+        vfs.create(
             &rel,
             want_dir,
             req.desired_access,
@@ -2398,7 +2484,8 @@ pub(crate) async fn create(
             req.attrs,
         )
         .await
-    {
+    };
+    let (mut open, meta, action) = match created {
         Ok(v) => v,
         // Traversal hit a symlink: build the Symbolic Link Error Response from
         // the target and unparsed path ([MS-SMB2] §2.2.2.2.1) for the caller to
@@ -2424,7 +2511,6 @@ pub(crate) async fn create(
     }
     open.delete_on_close |= req.options & OPT_DELETE_ON_CLOSE != 0;
 
-    let fid_bytes = next_file_id();
     let path = open.path.clone();
     let is_dir = open.is_dir;
     // Application-instance failover ([MS-SMB2] §3.3.5.9.13): a CREATE carrying
@@ -2458,12 +2544,14 @@ pub(crate) async fn create(
     // directory, an incompatible open first revokes HANDLE caching on any
     // directory lease ([MS-SMB2] §3.3.1.4). Undo the just-opened handle on
     // rejection.
-    if !server.share_modes.try_open(
-        &path,
-        req.desired_access,
-        req.share_access,
-        (conn.session_id, fid_bytes),
-    ) {
+    if reservation.is_none()
+        && !server.share_modes.try_open(
+            &path,
+            req.desired_access,
+            req.share_access,
+            (conn.session_id, fid_bytes),
+        )
+    {
         if is_dir {
             break_dir_lease_wait(server, conn, &path, fid_bytes, c::lease::HANDLE_CACHING).await;
         }
@@ -2475,6 +2563,9 @@ pub(crate) async fn create(
     let fid = c::FileId(fid_bytes);
     conn.searches.remove(&fid_bytes);
     conn.handle_insert(fid_bytes, open);
+    if let Some(reservation) = &reservation {
+        reservation.committed.store(true, Ordering::Release);
+    }
     // Seed per-open channel-sequence replay state ([MS-SMB2] §3.3.5.2.10).
     if let Some(scope) = conn.scope.as_ref() {
         let channel_sequence = u16::from_le_bytes([buf[hdr::STATUS], buf[hdr::STATUS + 1]]);
@@ -2544,9 +2635,8 @@ pub(crate) async fn create(
             .unwrap_or(false);
     let granted = if lease_context && (!is_dir || dir_leasing) {
         if let Some(lr) = req.lease {
-            let (resp, ack_waits) = arbitrate_lease(
-                server, conn, &path, fid_bytes, &lr, req_signed, is_dir,
-            );
+            let (resp, ack_waits) =
+                arbitrate_lease(server, conn, &path, fid_bytes, &lr, req_signed, is_dir);
             lease_grant = Some(resp);
             conn.lease_keys.insert(fid_bytes, lr.key);
             // Block this conflicting create until the prior holders acknowledge
@@ -4069,9 +4159,14 @@ pub(crate) fn share_vfs(
     conn: &Smb2Conn,
     tid: u32,
 ) -> Option<Arc<dyn smb_server_vfs::Vfs>> {
-    conn.tree_name(tid)
-        .and_then(|n| server.shares.get(&n))
-        .map(|s| s.vfs.clone())
+    let share = server.shares.get(&conn.tree_name(tid)?)?;
+    match &share.principal_vfs {
+        Some(principals) if conn.authenticated && !conn.guest => {
+            principals.get(&conn.user.to_lowercase()).cloned()
+        }
+        Some(_) => None,
+        None => Some(share.vfs.clone()),
+    }
 }
 
 /// Server-side-copy nonce appended to a resume key so repeated keys on one
@@ -4157,6 +4252,7 @@ pub(crate) fn vfs_err(e: smb_server_vfs::VfsError) -> Status {
         E::NotFound => Status::OBJECT_PATH_NOT_FOUND,
         E::AlreadyExists => Status::OBJECT_NAME_COLLISION,
         E::AccessDenied => Status::ACCESS_DENIED,
+        E::SharingViolation => Status::SHARING_VIOLATION,
         E::DirectoryNotEmpty => Status::DIRECTORY_NOT_EMPTY,
         E::InvalidArgument => Status::INVALID_PARAMETER,
         E::NotSupported => Status::NOT_IMPLEMENTED,
@@ -4509,6 +4605,7 @@ mod oplock_tests {
                 name: "public".into(),
                 root: dir.to_path_buf(),
                 vfs,
+                principal_vfs: None,
                 is_ipc: false,
                 encrypt: false,
                 compress: false,
@@ -4554,6 +4651,49 @@ mod oplock_tests {
     /// The sole opener requesting an oplock gets EXCLUSIVE; a second open on the
     /// same file breaks that oplock (a break notification lands on the first
     /// connection's outbound queue) and itself gets no oplock.
+    #[test]
+    fn shadow_sharing_rejection_preserves_data_and_other_principal_can_open() {
+        tokio_uring::start(async {
+            let temp = tempfile::tempdir().unwrap();
+            let base = temp.path().join("base");
+            let root = temp.path().join("private");
+            std::fs::create_dir(&base).unwrap();
+            std::fs::create_dir(&root).unwrap();
+            std::fs::write(base.join("shared.bin"), b"immutable data").unwrap();
+            let config: sambafied_shadow::Config = serde_json::from_value(serde_json::json!({
+                "base": base, "root": root,
+                "identity": { "organization": "org", "share": "games", "principal": "alice", "base_version": "v1" },
+                "policy": { "active_bytes": 4096, "active_files": 20, "retained_bytes": 4096,
+                    "temporary_bytes": 4096, "max_file_bytes": 1024, "snapshot_limit": 10,
+                    "history_limit": 100, "snapshot_ttl_seconds": 3600,
+                    "recovery_protection_seconds": 300, "trash_ttl_seconds": 3600 }
+            })).unwrap();
+            let alice: Arc<dyn smb_server_vfs::Vfs> = Arc::new(
+                smb_server_backend_shadow::ShadowVfs::new(config.clone()).unwrap());
+            let manager = sambafied_shadow::Store::open(config.clone()).unwrap();
+            let mut bob_config = config;
+            bob_config.identity.principal = "bob".into();
+            let bob: Arc<dyn smb_server_vfs::Vfs> = Arc::new(
+                smb_server_backend_shadow::ShadowVfs::new(bob_config).unwrap());
+            let server = server_with_share(&base);
+            let (tx, _rx) = mpsc::channel(8);
+            let mut first = Smb2Conn::new([0; 8], tx);
+            first.session_id = 1;
+            let request = create_request("shared.bin", c::oplock::BATCH, 0x8000_0000, 0);
+            let response = create(&mut first, alice.clone(), &server, false, false, &request).await.unwrap();
+            assert_eq!(response[2], c::oplock::NONE);
+            let (tx, _rx) = mpsc::channel(8);
+            let mut second = Smb2Conn::new([0; 8], tx);
+            second.session_id = 2;
+            let mut overwrite = create_request("shared.bin", c::oplock::NONE, 0x4000_0000, 7);
+            overwrite[64 + 36..64 + 40].copy_from_slice(&5u32.to_le_bytes());
+            assert_eq!(create(&mut second, alice, &server, false, false, &overwrite).await.unwrap_err(), Status::SHARING_VIOLATION);
+            assert_eq!(manager.read("shared.bin").unwrap(), b"immutable data");
+            create(&mut second, bob, &server, false, false, &request).await.unwrap();
+            assert_eq!(std::fs::read(base.join("shared.bin")).unwrap(), b"immutable data");
+        });
+    }
+
     #[test]
     fn oplock_granted_then_broken_on_second_open() {
         tokio_uring::start(async {
@@ -4628,6 +4768,7 @@ mod lease_tests {
                 name: "public".into(),
                 root: dir.to_path_buf(),
                 vfs,
+                principal_vfs: None,
                 is_ipc: false,
                 encrypt: false,
                 compress: false,
@@ -5005,6 +5146,7 @@ mod durable_tests {
                 name: "public".into(),
                 root: dir.to_path_buf(),
                 vfs,
+                principal_vfs: None,
                 is_ipc: false,
                 encrypt: false,
                 compress: false,

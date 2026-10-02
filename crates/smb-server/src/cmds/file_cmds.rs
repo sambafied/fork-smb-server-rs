@@ -273,6 +273,7 @@ pub(crate) fn vfs_err(e: smb_server_vfs::VfsError) -> Status {
         E::NotFound => Status::OBJECT_PATH_NOT_FOUND,
         E::AlreadyExists => Status::OBJECT_NAME_COLLISION,
         E::AccessDenied => Status::ACCESS_DENIED,
+        E::SharingViolation => Status::SHARING_VIOLATION,
         E::DirectoryNotEmpty => Status::DIRECTORY_NOT_EMPTY,
         E::InvalidArgument => Status::INVALID_PARAMETER,
         E::NotSupported => Status::NOT_IMPLEMENTED,
