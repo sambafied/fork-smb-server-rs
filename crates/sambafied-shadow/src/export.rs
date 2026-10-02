@@ -110,7 +110,10 @@ impl Store {
                 || entry.name.contains(['/', '\\'])
                 || normalize(&entry.name).map_err(|_| Error::Corrupt)?
                     != path.rsplit('/').next().ok_or(Error::Corrupt)?
-                || Uuid::parse_str(&entry.object_id).is_err()
+                // Copy-up and rename preserve the pinned base object's stable
+                // identity; only newly created objects receive UUIDs.
+                || (Uuid::parse_str(&entry.object_id).is_err()
+                    && !self.base.values().any(|base| base.object_id == entry.object_id))
                 || entry.size > self.config.policy.max_file_bytes
                 || (entry.directory && (entry.size != 0 || entry.digest.is_some()))
             {
