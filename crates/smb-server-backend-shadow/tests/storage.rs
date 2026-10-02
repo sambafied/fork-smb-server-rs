@@ -238,6 +238,19 @@ async fn dropped_handles_apply_pending_delete_and_release_maintenance_lease() {
         manager.reset(manager.inspect().unwrap().revision, "alice"),
         Err(sambafied_shadow::Error::Busy)
     ));
+    let before = manager.inspect().unwrap().revision;
+    alice
+        .set_info_open(
+            &mut file,
+            &SetOp::Basic {
+                access: None,
+                write: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(manager.inspect().unwrap().revision, before);
+    assert_eq!(manager.read("base.txt").unwrap(), b"immutable base");
     alice
         .set_info_open(&mut file, &SetOp::Disposition { delete: true })
         .await
@@ -339,7 +352,7 @@ async fn metadata_only_root_opens_and_unsupported_operations_are_explicit() {
             .set_info_open(
                 &mut file,
                 &SetOp::Basic {
-                    access: None,
+                    access: Some(smb_server_proto::types::FileTime(1)),
                     write: None
                 }
             )

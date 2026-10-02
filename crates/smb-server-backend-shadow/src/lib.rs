@@ -557,6 +557,17 @@ impl Vfs for ShadowVfs {
                     .replace('/', "\\");
                 Ok(())
             }
+            SetOp::Basic {
+                access: None,
+                write: None,
+            } => {
+                // Clients send unchanged timestamps before delete disposition.
+                // Validate the handle without copying up or changing metadata.
+                self.run(move |store, _| {
+                    store.stat_handle(&handle).map(|_| ()).map_err(error)
+                })
+                .await
+            }
             SetOp::Allocation(_) | SetOp::Basic { .. } | SetOp::Ea { .. } => {
                 Err(VfsError::NotSupported)
             }
