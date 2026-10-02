@@ -1,9 +1,10 @@
-# Share policy catalogue: CORE STORE ENFORCEMENT ONLY
+# Share policy catalogue: Core Store and SMB adapter enforcement
 
 `SharePolicyCatalog` is a durable organisation/share policy authority primitive.
 Core Store operations can now use that authority through
 `Store::open_with_policy_catalog`. The SMB adapter can opt in through `ShadowVfs::new_with_policy_catalog`;
-server startup configuration and product API, CLI and UI wiring remain incomplete. This work does not establish end-to-end
+optional server startup configuration is described below. Product policy API, CLI
+and UI wiring remain incomplete. This work does not establish end-to-end
 live enforcement or complete the live-policy milestone.
 
 ## Scope and persistence
@@ -29,6 +30,24 @@ reads are bounded by pinned entry sizes, and changed pinned content still fails
 with `Error::Corrupt`. The configured base scanning ceiling remains relevant
 when opening a Store; a lower catalogue write limit does not hide pinned base
 files.
+
+## Optional SMB server startup authority
+
+The current startup source adds `--shadow-policy-root PATH`, which requires
+`--shadow-config`. PATH must be an existing absolute server-owned directory;
+the catalogue rejects a symlink root. This trusted host path is not selected
+by SMB clients.
+
+For each configured shadow share, every mapped user must supply identical
+startup policy values and the same organisation, share and base version.
+Conflicting defaults or scope fail startup rather than selecting one user's
+policy. All mapped users of that share receive the same catalogue authority,
+while their private storage namespaces remain separate. A new catalogue
+persists the common initial policy; reopening preserves durable edits and
+revision history instead of overwriting them with startup defaults.
+
+Omitting `--shadow-policy-root` keeps the existing static configuration path
+through `ShadowVfs::new` and `Store::open`.
 
 ## Leases, replacement and preview binding
 
@@ -85,23 +104,29 @@ cross-process reader-kill test showing that process death releases the gate
 without changing the policy revision. This receipt qualifies the foundation
 source only.
 
-For the current Core Store enforcement changes, the parent reports Windows
-verification of 72 passing core tests (63 existing and nine new), two ignored
-subprocess fixture helpers and strict Clippy passing. Added Store tests cover
-updated limits on already-open handles while preserving existing data and
-state, policy ABA invalidation of previews and queued actions, wrong-catalogue
-rejection before namespace creation, and policy-lease retention through every
-archive writer call. The pinned-base corruption regression continues to require
-`Error::Corrupt` and passes in the current suite. These checks qualify Core
-Store enforcement only, not SMB integration or end-to-end authorization.
+The parent verified all four PR #13 checks green for committed Core Store and
+SMB adapter source at `df650c1`, including portable Linux and native SMB checks
+on push and PR. Windows verification included 72 passing core tests, two
+ignored subprocess fixture helpers, strict Clippy and seven SMB adapter storage
+tests. Coverage includes current limits on already-open handles, preserved
+reads and state, policy ABA invalidation, wrong-catalogue rejection, policy
+leases through archive writes, disk free space, Bob isolation and unchanged
+base content. These receipts qualify that committed source, not the subsequent
+startup changes.
 
-The prior portable Linux CI run at `a8d1d9c` failed the independent-reader lease
-release test with `Error::Busy` after the lease was dropped. Commit `9c0702c`
-adds explicit lease unlocking. The parent verified all four PR #13 checks green
-at `9c0702c5c20f7ca55f79daa28a66e246753a0b88`, including portable Linux and native
-SMB checks on push and PR. This qualifies that committed lease correction, not
-the current uncommitted Store enforcement changes. Inherited fork descriptors
-remain a possible explanation for the prior failure, not a verified cause.
+The optional startup source and native fixture are committed at `b2ecb8e`
+but have not yet been compiled or qualified by the new Linux CI run. Added regression tests cover conflicting startup defaults/scope
+before catalogue publication, preservation of a committed policy edit on
+reopen, and the CLI requirement for explicit shadow configuration. The native
+Linux fixture now selects a shared policy root and checks one policy document
+and unchanged document bytes across a server restart; execution in CI is
+planned. This fixture does not itself exercise an administrative policy edit
+or establish live network policy-change acceptance.
+
+The earlier portable Linux failure at `a8d1d9c` returned `Error::Busy` after an
+independent-reader lease was dropped. Commit `9c0702c` added explicit lease
+unlocking and its four checks passed. Inherited fork descriptors remain a
+possible explanation for the prior failure, not a verified cause.
 
 The read-only destination publication-fault test is Windows-specific. Unix
 publication-fault behavior is not qualified by it: Unix rename can replace a
@@ -109,15 +134,10 @@ read-only inode. None of these receipts constitutes milestone acceptance.
 
 ## Remaining runtime work
 
-Wire the catalogue-backed Store into trusted SMB backend configuration and
-provide authorized share policy GET/PUT with ETag concurrency control and
-matching CLI/UI behavior. Qualify integrated quota, retention and grants
-scenarios and qualify the current Store enforcement changes on Linux. Any
-unsupported policy fields or
-scheduler behavior require their own implementation and qualification; Core
-Store enforcement does not promise their acceptance or execution.
-
-The parent also verified seven Windows SMB adapter storage tests, including an
-already-open protocol handle observing reduced write limits while retaining reads,
-updated disk free space, Bob isolation and unchanged base content. This is adapter
-coverage, not network or server-startup qualification.
+Compile and qualify the optional trusted SMB startup wiring, then provide
+authorized share policy GET/PUT with ETag concurrency control and matching
+product CLI/UI behavior. Qualify integrated quota, retention and grants
+scenarios. Unsupported policy fields or scheduler behavior require their own
+implementation and qualification; Core Store enforcement does not promise
+their acceptance or execution. The primitive still supplies no caller
+authorization and has a bounded audit outbox without a drain path.
