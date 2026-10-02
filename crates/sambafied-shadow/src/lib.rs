@@ -12,9 +12,11 @@ pub use artifacts::{ArtifactPolicy, ExportArtifact};
 mod backup_jobs;
 mod export;
 mod management;
+mod policy_catalog;
 pub use backup_jobs::BackupCatalog;
 pub use export::{ExportManifest, ExportPreflight, ExportSummary};
 pub use management::{Action, ActionImpact, Job, JobResult, JobStatus, RequestBinding, Submission};
+pub use policy_catalog::{PolicyChange, PolicyDocument, PolicyRead, SharePolicyCatalog};
 
 use atomic_write_file::AtomicWriteFile;
 use serde::{Deserialize, Serialize};
