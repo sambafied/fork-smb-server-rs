@@ -48,6 +48,33 @@ pub struct Job {
     pub updated_at: u64,
     pub result: Option<JobResult>,
     pub error_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_binding: Option<RequestBinding>,
+}
+
+/// Private confirmation metadata, not authorization or an API token.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RequestBinding {
+    pub plan_id: String,
+    pub source_fingerprint: String,
+}
+impl RequestBinding {
+    pub(crate) fn validate(&self) -> Result<()> {
+        if Uuid::parse_str(&self.plan_id)
+            .map_err(|_| Error::Path)?
+            .to_string()
+            != self.plan_id
+            || self.source_fingerprint.len() != 64
+            || !self
+                .source_fingerprint
+                .bytes()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        {
+            return Err(Error::Path);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -99,6 +126,23 @@ impl Store {
         actor: &str,
         action: Action,
     ) -> Result<ActionImpact> {
+        self.preview_inner(expected, actor, action, false)
+    }
+    pub fn preview_planned_action(
+        &self,
+        expected: u64,
+        actor: &str,
+        action: Action,
+    ) -> Result<ActionImpact> {
+        self.preview_inner(expected, actor, action, true)
+    }
+    fn preview_inner(
+        &self,
+        expected: u64,
+        actor: &str,
+        action: Action,
+        planned: bool,
+    ) -> Result<ActionImpact> {
         if actor.is_empty() || actor.len() > 256 {
             return Err(Error::Path);
         }
@@ -120,6 +164,10 @@ impl Store {
                 self.rollback_locked(&mut staged, snapshot_id, actor)?;
             }
             Action::RestoreTrash { trash_id } => {
+                if planned {
+                    self.retain(&mut staged, true)?;
+                    staged.generation = id();
+                }
                 self.restore_trash_prepared(&mut staged, trash_id, actor, false)?;
             }
             Action::PurgeTrash { trash_id } => {
@@ -159,8 +207,9 @@ impl Store {
             generation: original.generation,
             base_version: original.identity.base_version,
             fingerprint,
-            recovery_retention_seconds: matches!(action, Action::Reset | Action::Rollback { .. })
-                .then_some(self.config.policy.recovery_protection_seconds),
+            recovery_retention_seconds: (matches!(action, Action::Reset | Action::Rollback { .. })
+                || (planned && matches!(action, Action::RestoreTrash { .. })))
+            .then_some(self.config.policy.recovery_protection_seconds),
             physical_reclamation_deferred: matches!(
                 action,
                 Action::PurgeTrash { .. } | Action::DeleteSnapshot { .. }
@@ -182,6 +231,28 @@ impl Store {
         key: &str,
         action: Action,
     ) -> Result<Submission> {
+        self.submit_inner(expected, actor, key, action, None)
+    }
+    /// Check source under the serial lock to close the preview/admission race.
+    pub fn submit_planned_job(
+        &self,
+        expected: u64,
+        actor: &str,
+        key: &str,
+        action: Action,
+        binding: RequestBinding,
+    ) -> Result<Submission> {
+        binding.validate()?;
+        self.submit_inner(expected, actor, key, action, Some(binding))
+    }
+    fn submit_inner(
+        &self,
+        expected: u64,
+        actor: &str,
+        key: &str,
+        action: Action,
+        binding: Option<RequestBinding>,
+    ) -> Result<Submission> {
         if actor.is_empty() || actor.len() > 256 || key.is_empty() || key.len() > 256 {
             return Err(Error::Path);
         }
@@ -195,7 +266,10 @@ impl Store {
             .values()
             .find(|j| j.actor == actor && j.key_digest == key_digest)
         {
-            if job.expected_revision != expected || job.action != action {
+            if job.expected_revision != expected
+                || job.action != action
+                || job.request_binding != binding
+            {
                 return Err(Error::Idempotency);
             }
             return Ok(Submission {
@@ -204,6 +278,12 @@ impl Store {
             });
         }
         self.revision(&state, expected)?;
+        if let Some(binding) = &binding
+            && digest(&serde_json::to_vec(&(&state, &self.config.policy))?)
+                != binding.source_fingerprint
+        {
+            return Err(Error::Revision);
+        }
         if state.jobs.len() >= JOB_LIMIT {
             return Err(Error::Quota);
         }
@@ -219,6 +299,7 @@ impl Store {
             updated_at: at,
             result: None,
             error_code: None,
+            request_binding: binding,
         };
         state.jobs.insert(job.id.clone(), job.clone());
         self.save(&state)?;
@@ -226,6 +307,49 @@ impl Store {
             job,
             replayed: false,
         })
+    }
+
+    /// Locate an accepted exact request before requiring an ephemeral plan.
+    /// The API must reauthorize scope/action first. Expiry or restart cannot
+    /// cause an accepted retry to create another job.
+    pub fn planned_submission(
+        &self,
+        expected: u64,
+        actor: &str,
+        key: &str,
+        action: &Action,
+        plan_id: &str,
+    ) -> Result<Option<Job>> {
+        if actor.is_empty()
+            || actor.len() > 256
+            || key.is_empty()
+            || key.len() > 256
+            || Uuid::parse_str(plan_id).is_err()
+        {
+            return Err(Error::Path);
+        }
+        action.validate()?;
+        let _lease = self.lease()?;
+        let _serial = self.serial()?;
+        let state = self.load()?;
+        let key_digest = digest(key.as_bytes());
+        let Some(job) = state
+            .jobs
+            .values()
+            .find(|job| job.actor == actor && job.key_digest == key_digest)
+        else {
+            return Ok(None);
+        };
+        if job.expected_revision != expected
+            || job.action != *action
+            || !job
+                .request_binding
+                .as_ref()
+                .is_some_and(|binding| binding.plan_id == plan_id)
+        {
+            return Err(Error::Idempotency);
+        }
+        Ok(Some(job.clone()))
     }
 
     /// Actor scoping is mandatory even when a job id is known. Administrative
@@ -267,6 +391,15 @@ impl Store {
         let operation = (|| {
             allowed?;
             self.revision(&original, job.expected_revision)?;
+            if let Some(binding) = &job.request_binding {
+                let mut source = original.clone();
+                source.jobs.remove(job_id);
+                if digest(&serde_json::to_vec(&(&source, &self.config.policy))?)
+                    != binding.source_fingerprint
+                {
+                    return Err(Error::Revision);
+                }
+            }
             job.status = JobStatus::Running;
             job.updated_at = now();
             original.jobs.insert(job.id.clone(), job.clone());
@@ -291,6 +424,10 @@ impl Store {
                         Some(self.rollback_locked(&mut staged, snapshot_id, actor)?)
                 }
                 Action::RestoreTrash { trash_id } => {
+                    if job.request_binding.is_some() {
+                        result.recovery_snapshot_id = Some(self.retain(&mut staged, true)?);
+                        staged.generation = id();
+                    }
                     self.restore_trash_locked(&mut staged, trash_id, actor)?
                 }
                 Action::PurgeTrash { trash_id } => {

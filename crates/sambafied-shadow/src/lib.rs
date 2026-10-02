@@ -7,7 +7,7 @@
 #![forbid(unsafe_code)]
 
 mod management;
-pub use management::{Action, ActionImpact, Job, JobResult, JobStatus, Submission};
+pub use management::{Action, ActionImpact, Job, JobResult, JobStatus, RequestBinding, Submission};
 
 use atomic_write_file::AtomicWriteFile;
 use serde::{Deserialize, Serialize};
@@ -408,15 +408,15 @@ impl Store {
         let _serial = store.serial()?;
         if store.state_path().exists() {
             let mut state = store.load()?;
-            if state.schema == 1 {
+            if state.schema < 3 {
                 let _maintenance = store.maintenance()?;
-                state.schema = 2;
+                state.schema = 3;
                 store.save(&state)?;
             }
             store.collect_blobs(&state)?;
         } else {
             store.save(&State {
-                schema: 2,
+                schema: 3,
                 identity: store.config.identity.clone(),
                 base_digest: store.base_digest.clone(),
                 generation: id(),
@@ -451,8 +451,13 @@ impl Store {
     fn load(&self) -> Result<State> {
         let state: State =
             serde_json::from_slice(&bounded_read(&self.state_path(), 16 * 1024 * 1024)?)?;
-        if !matches!(state.schema, 1 | 2)
+        if !matches!(state.schema, 1..=3)
             || (state.schema == 1 && !state.jobs.is_empty())
+            || state.jobs.values().any(|job| {
+                job.request_binding
+                    .as_ref()
+                    .is_some_and(|binding| state.schema < 3 || binding.validate().is_err())
+            })
             || state.identity != self.config.identity
             || state.base_digest != self.base_digest
         {
