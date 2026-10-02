@@ -3,7 +3,9 @@
 #![forbid(unsafe_code)]
 
 use async_trait::async_trait;
-use sambafied_shadow::{Config, Handle, OpenAction, OpenDisposition, OpenRequest, Store};
+use sambafied_shadow::{
+    Config, Handle, OpenAction, OpenDisposition, OpenRequest, SharePolicyCatalog, Store,
+};
 use smb_server_proto::types::{AttrFlags, FileTime};
 use smb_server_vfs::{
     CreateArgs, Entry, FileMeta, OpenCheck, OpenFile, SetOp, Vfs, VfsError, VfsResult,
@@ -118,7 +120,6 @@ pub struct ShadowVfs {
     store: Arc<Store>,
     actor: String,
     key_prefix: String,
-    active_limit: u64,
     registry: Arc<Mutex<Registry>>,
     workers: Arc<tokio::sync::Semaphore>,
 }
@@ -163,17 +164,24 @@ impl ShadowVfs {
     /// Validate and open a server-owned namespace during startup.
     pub fn new(config: Config) -> VfsResult<Self> {
         let actor = config.identity.principal.clone();
-        let active_limit = config.policy.active_bytes;
         let store = Store::open(config).map_err(error)?;
+        Ok(Self::from_store(store, actor))
+    }
+    /// Open against the trusted share authority; each operation leases current policy.
+    pub fn new_with_policy_catalog(config: Config, catalog: SharePolicyCatalog) -> VfsResult<Self> {
+        let actor = config.identity.principal.clone();
+        let store = Store::open_with_policy_catalog(config, catalog).map_err(error)?;
+        Ok(Self::from_store(store, actor))
+    }
+    fn from_store(store: Arc<Store>, actor: String) -> Self {
         let key_prefix = format!("{}::", store.namespace().display());
-        Ok(Self {
+        Self {
             store,
             actor,
             key_prefix,
-            active_limit,
             registry: Arc::new(Mutex::new(Registry::default())),
             workers: Arc::new(tokio::sync::Semaphore::new(WORKERS)),
-        })
+        }
     }
     async fn run<T, F>(&self, operation: F) -> VfsResult<T>
     where
@@ -563,10 +571,8 @@ impl Vfs for ShadowVfs {
             } => {
                 // Clients send unchanged timestamps before delete disposition.
                 // Validate the handle without copying up or changing metadata.
-                self.run(move |store, _| {
-                    store.stat_handle(&handle).map(|_| ()).map_err(error)
-                })
-                .await
+                self.run(move |store, _| store.stat_handle(&handle).map(|_| ()).map_err(error))
+                    .await
             }
             SetOp::Allocation(_) | SetOp::Basic { .. } | SetOp::Ea { .. } => {
                 Err(VfsError::NotSupported)
@@ -577,16 +583,10 @@ impl Vfs for ShadowVfs {
         Err(VfsError::NotSupported)
     }
     async fn query_disk(&self) -> VfsResult<(u32, u32, u16, u16)> {
-        let limit = self.active_limit;
         self.run(move |store, _| {
-            let used: u64 = store
-                .inspect()
-                .map_err(error)?
-                .view
-                .upper
-                .values()
-                .map(|entry| entry.size)
-                .sum();
+            let (state, policy, _) = store.inspect_with_policy().map_err(error)?;
+            let limit = policy.active_bytes;
+            let used: u64 = state.view.upper.values().map(|entry| entry.size).sum();
             let total = limit.div_ceil(4096).min(u32::MAX as u64) as u32;
             let free = limit.saturating_sub(used).div_ceil(4096).min(total as u64) as u32;
             Ok((total, free, 8, 512))

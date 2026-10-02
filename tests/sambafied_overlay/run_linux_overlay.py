@@ -27,6 +27,25 @@ REPOSITORY_ROOT = ROOT.parents[1]
 DEFAULT_BINARY = Path("target/debug/rustsmb")
 READY_TIMEOUT_SECONDS = 30
 SHUTDOWN_TIMEOUT_SECONDS = 10
+MAX_POLICY_DOCUMENT_BYTES = 16 * 1024 * 1024
+
+
+def policy_document_digest(root: Path) -> tuple[str, bytes]:
+    """Compare server-created authority without retaining its contents or path."""
+    documents = list(root.glob("*.policy.json"))
+    if len(documents) != 1:
+        raise RuntimeError("the fixture did not create exactly one shared policy document")
+    document = documents[0]
+    if document.is_symlink() or not document.is_file():
+        raise RuntimeError("the policy document is not an owned regular file")
+    with document.open("rb") as source:
+        content = source.read(MAX_POLICY_DOCUMENT_BYTES + 1)
+    if len(content) > MAX_POLICY_DOCUMENT_BYTES:
+        raise RuntimeError("the policy document exceeded the bounded read limit")
+    parsed = json.loads(content)
+    if not isinstance(parsed, dict) or not all(key in parsed for key in ("revision", "policy", "changes")):
+        raise RuntimeError("the policy document omitted its revision, policy or audit")
+    return document.name, hashlib.sha256(content).digest()
 
 
 def choose_port() -> int:
@@ -167,10 +186,11 @@ def main() -> int:
     try:
         with tempfile.TemporaryDirectory(prefix="sambafied-overlay-") as temporary:
             try:
-                fixture = Path(temporary)
-                base, private = fixture / "base", fixture / "private"
+                fixture = Path(temporary).resolve()
+                base, private, policies = fixture / "base", fixture / "private", fixture / "policies"
                 base.mkdir()
                 private.mkdir()
+                policies.mkdir(mode=0o700)
                 fixture_file = ROOT / "BASE.TXT"
                 base_file = base / "BASE.TXT"
                 base_file.write_bytes(fixture_file.read_bytes())
@@ -181,6 +201,7 @@ def main() -> int:
                 command = [
                     str(binary), "--users-stdin", "--bind", f"127.0.0.1:{port}",
                     "--share", f"games={base}", "--shadow-config", str(config_path), "--require-signing",
+                    "--shadow-policy-root", str(policies),
                 ]
                 with log_path.open("wb") as log_file:
                     process = subprocess.Popen(
@@ -209,6 +230,23 @@ def main() -> int:
                     )
                     if result.returncode != 0:
                         raise RuntimeError("the two-user overlay actuator returned a non-zero status")
+                    terminate_owned_process(process)
+                    before_restart = policy_document_digest(policies)
+                    process = subprocess.Popen(
+                        command, stdin=subprocess.PIPE, stdout=log_file, stderr=subprocess.STDOUT,
+                        cwd=binary.parent.parent.parent,
+                        env={**os.environ, "RUST_LOG": "info"},
+                    )
+                    assert process.stdin is not None
+                    process.stdin.write(json.dumps(accounts).encode("utf-8"))
+                    process.stdin.close()
+                    wait_for_listener(process, port)
+                    if policy_document_digest(policies) != before_restart:
+                        raise RuntimeError("the shared policy document changed across server restart")
+                    terminate_owned_process(process)
+                    if policy_document_digest(policies) != before_restart:
+                        raise RuntimeError("the shared policy document changed on restarted server shutdown")
+                    metadata["policyCatalog"] = {"sharedDocumentCount": 1, "restartUnchanged": True}
                 if hashlib.sha256(base_file.read_bytes()).digest() != hashlib.sha256(fixture_file.read_bytes()).digest():
                     raise RuntimeError("the base fixture changed during the SMB contract")
             finally:

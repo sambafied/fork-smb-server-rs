@@ -12,9 +12,11 @@ pub use artifacts::{ArtifactPolicy, ExportArtifact};
 mod backup_jobs;
 mod export;
 mod management;
+mod policy_catalog;
 pub use backup_jobs::BackupCatalog;
 pub use export::{ExportManifest, ExportPreflight, ExportSummary};
 pub use management::{Action, ActionImpact, Job, JobResult, JobStatus, RequestBinding, Submission};
+pub use policy_catalog::{PolicyChange, PolicyDocument, PolicyRead, SharePolicyCatalog};
 
 use atomic_write_file::AtomicWriteFile;
 use serde::{Deserialize, Serialize};
@@ -221,13 +223,21 @@ pub struct State {
     pub artifacts: BTreeMap<String, ExportArtifact>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Store {
     config: Config,
     namespace: PathBuf,
-    base: BTreeMap<String, Entry>,
-    base_paths: BTreeMap<String, PathBuf>,
+    base: Arc<BTreeMap<String, Entry>>,
+    base_paths: Arc<BTreeMap<String, PathBuf>>,
     base_digest: String,
+    policy_catalog: Option<SharePolicyCatalog>,
+    policy_revision: Option<u64>,
+}
+
+struct PolicyOperation {
+    store: Store,
+    _serial: Lease,
+    _policy: Option<PolicyRead>,
 }
 
 /// A lease is retained for the complete lifetime of an SMB handle. Dropping
@@ -235,6 +245,15 @@ pub struct Store {
 #[derive(Debug)]
 pub struct Lease {
     _file: File,
+}
+
+impl Drop for Lease {
+    fn drop(&mut self) {
+        // Release ownership explicitly: a concurrent Unix process spawn can
+        // briefly inherit the open file description before close-on-exec.
+        // Merely closing our descriptor can then leave its lock behind.
+        let _ = self._file.unlock();
+    }
 }
 
 #[derive(Debug)]
@@ -354,6 +373,13 @@ fn bounded_read(path: &Path, limit: u64) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+fn pinned_content(path: &Path, size: u64) -> Result<Vec<u8>> {
+    bounded_read(path, size).map_err(|error| match error {
+        Error::Quota => Error::Corrupt,
+        other => other,
+    })
+}
+
 fn lock(path: &Path, exclusive: bool, nonblocking: bool) -> Result<Lease> {
     let file = OpenOptions::new()
         .read(true)
@@ -379,7 +405,35 @@ fn lock(path: &Path, exclusive: bool, nonblocking: bool) -> Result<Lease> {
 impl Store {
     /// Initialize or reopen an opaque namespace. The base tree is hashed and
     /// must match the persisted pinned identity on every subsequent open.
-    pub fn open(mut config: Config) -> Result<Arc<Self>> {
+    pub fn open(config: Config) -> Result<Arc<Self>> {
+        Self::open_with_catalog(config, None)
+    }
+
+    /// Open against a server-owned shared policy authority. Every operation
+    /// retains a consistent policy lease, including operations on old handles.
+    pub fn open_with_policy_catalog(
+        config: Config,
+        catalog: SharePolicyCatalog,
+    ) -> Result<Arc<Self>> {
+        Self::open_with_catalog(config, Some(catalog))
+    }
+
+    fn open_with_catalog(
+        mut config: Config,
+        policy_catalog: Option<SharePolicyCatalog>,
+    ) -> Result<Arc<Self>> {
+        let opening_policy = policy_catalog
+            .as_ref()
+            .map(SharePolicyCatalog::read)
+            .transpose()?;
+        if let Some(policy) = &opening_policy
+            && (policy.document().organization != config.identity.organization
+                || policy.document().share != config.identity.share)
+        {
+            return Err(Error::Corrupt);
+        }
+        // Keep the configured ceiling for scanning pinned base data. Reducing
+        // private write limits must not make already-pinned base files vanish.
         config.policy.validate()?;
         if [
             &config.identity.organization,
@@ -416,9 +470,11 @@ impl Store {
         let store = Arc::new(Self {
             config,
             namespace,
-            base,
-            base_paths,
+            base: Arc::new(base),
+            base_paths: Arc::new(base_paths),
             base_digest,
+            policy_catalog,
+            policy_revision: None,
         });
         let _serial = store.serial()?;
         if store.state_path().exists() {
@@ -455,8 +511,33 @@ impl Store {
     fn state_path(&self) -> PathBuf {
         self.namespace.join("state.json")
     }
-    fn serial(&self) -> Result<Lease> {
-        lock(&self.namespace.join("state.lock"), true, false)
+    fn serial(&self) -> Result<PolicyOperation> {
+        // Policy precedes state in the lock order. Replacement never takes a
+        // state lock and therefore cannot race a partially enforced operation.
+        let policy = self
+            .policy_catalog
+            .as_ref()
+            .map(SharePolicyCatalog::read)
+            .transpose()?;
+        let mut store = self.clone();
+        if let Some(policy) = &policy {
+            let document = policy.document();
+            if document.organization != self.config.identity.organization
+                || document.share != self.config.identity.share
+            {
+                return Err(Error::Corrupt);
+            }
+            store.config.policy = document.policy.clone();
+            store.policy_revision = Some(document.revision);
+        }
+        // Inner helpers use this immutable snapshot; the operation owns the
+        // external authority lease until all publication/validation is done.
+        store.policy_catalog = None;
+        Ok(PolicyOperation {
+            store,
+            _serial: lock(&self.namespace.join("state.lock"), true, false)?,
+            _policy: policy,
+        })
     }
     pub fn lease(&self) -> Result<Lease> {
         lock(&self.namespace.join("maintenance.lock"), false, true)
@@ -543,7 +624,20 @@ impl Store {
     pub fn inspect(&self) -> Result<State> {
         let _lease = self.lease()?;
         let _serial = self.serial()?;
-        self.load()
+        let current = &_serial.store;
+        current.load()
+    }
+
+    /// Inspect data and its effective policy under one operation lease. The
+    /// optional revision distinguishes the shared authority from static config.
+    pub fn inspect_with_policy(&self) -> Result<(State, Policy, Option<u64>)> {
+        let _lease = self.lease()?;
+        let operation = self.serial()?;
+        Ok((
+            operation.store.load()?,
+            operation.store.config.policy.clone(),
+            operation.store.policy_revision,
+        ))
     }
     fn lookup<'a>(&'a self, view: &'a View, path: &str) -> Option<&'a Entry> {
         view.upper.get(path).or_else(|| {
@@ -565,6 +659,7 @@ impl Store {
     pub fn stat(&self, path: &str) -> Result<Entry> {
         let _lease = self.lease()?;
         let _serial = self.serial()?;
+        let current = &_serial.store;
         let path = normalize(path)?;
         if path.is_empty() {
             return Ok(Entry {
@@ -575,7 +670,8 @@ impl Store {
                 digest: None,
             });
         }
-        self.lookup(&self.load()?.view, &path)
+        current
+            .lookup(&current.load()?.view, &path)
             .cloned()
             .ok_or(Error::NotFound)
     }
@@ -598,7 +694,8 @@ impl Store {
     pub fn list(&self, path: &str) -> Result<Vec<Entry>> {
         let _lease = self.lease()?;
         let _serial = self.serial()?;
-        self.listing(&self.load()?.view, &normalize(path)?)
+        let current = &_serial.store;
+        current.listing(&current.load()?.view, &normalize(path)?)
     }
     fn bytes(&self, state: &State, path: &str) -> Result<Vec<u8>> {
         let entry = self.lookup(&state.view, path).ok_or(Error::NotFound)?;
@@ -606,9 +703,9 @@ impl Store {
             return Err(Error::Unsupported);
         }
         let content = if state.view.upper.contains_key(path) {
-            bounded_read(
+            pinned_content(
                 &self.blob_path(entry.digest.as_deref().ok_or(Error::Corrupt)?)?,
-                self.config.policy.max_file_bytes,
+                entry.size,
             )?
         } else {
             let source = self.base_paths.get(path).ok_or(Error::Corrupt)?;
@@ -617,7 +714,7 @@ impl Store {
             if fs::symlink_metadata(source)?.file_type().is_symlink() {
                 return Err(Error::Corrupt);
             }
-            bounded_read(source, self.config.policy.max_file_bytes)?
+            pinned_content(source, entry.size)?
         };
         if content.len() as u64 != entry.size || Some(digest(&content)) != entry.digest {
             return Err(Error::Corrupt);
@@ -627,7 +724,8 @@ impl Store {
     pub fn read(&self, path: &str) -> Result<Vec<u8>> {
         let _lease = self.lease()?;
         let _serial = self.serial()?;
-        self.bytes(&self.load()?, &normalize(path)?)
+        let current = &_serial.store;
+        current.bytes(&current.load()?, &normalize(path)?)
     }
     fn blob_path(&self, hash: &str) -> Result<PathBuf> {
         if hash.len() != 64
@@ -726,27 +824,29 @@ impl Store {
     pub fn write_file(&self, path: &str, content: &[u8], actor: &str) -> Result<()> {
         let _lease = self.lease()?;
         let _serial = self.serial()?;
+        let current = &_serial.store;
         let path = normalize(path)?;
         if path.is_empty() {
             return Err(Error::Path);
         }
-        let mut state = self.load()?;
-        self.publish_file(&mut state, &path, content)?;
-        self.event(&mut state, actor, "write", Some(path), None)?;
-        self.save(&state)
+        let mut state = current.load()?;
+        current.publish_file(&mut state, &path, content)?;
+        current.event(&mut state, actor, "write", Some(path), None)?;
+        current.save(&state)
     }
     pub fn mkdir(&self, path: &str, actor: &str) -> Result<()> {
         let _lease = self.lease()?;
         let _serial = self.serial()?;
+        let current = &_serial.store;
         let path = normalize(path)?;
         if path.is_empty() {
             return Err(Error::Exists);
         }
-        let mut state = self.load()?;
-        if self.lookup(&state.view, &path).is_some() {
+        let mut state = current.load()?;
+        if current.lookup(&state.view, &path).is_some() {
             return Err(Error::Exists);
         }
-        if !self.parent_exists(&state.view, &path) {
+        if !current.parent_exists(&state.view, &path) {
             return Err(Error::NotFound);
         }
         state.view.upper.insert(
@@ -759,28 +859,30 @@ impl Store {
                 digest: None,
             },
         );
-        self.check_budget(&state)?;
-        self.event(&mut state, actor, "mkdir", Some(path), None)?;
-        self.save(&state)
+        current.check_budget(&state)?;
+        current.event(&mut state, actor, "mkdir", Some(path), None)?;
+        current.save(&state)
     }
     pub fn delete(&self, path: &str, actor: &str) -> Result<String> {
         let _lease = self.lease()?;
         let _serial = self.serial()?;
+        let current = &_serial.store;
         let path = normalize(path)?;
         if path.is_empty() {
             return Err(Error::Path);
         }
-        let mut state = self.load()?;
-        self.delete_locked(&mut state, path, actor)
+        let mut state = current.load()?;
+        current.delete_locked(&mut state, path, actor)
     }
     /// Delete a path only if it still has the required kind. The kind check
     /// and deletion share one lock, avoiding unlink/rmdir check-then-use races.
     pub fn delete_typed(&self, path: &str, directory: bool, actor: &str) -> Result<String> {
         let _lease = self.lease()?;
         let _serial = self.serial()?;
+        let current = &_serial.store;
         let path = normalize(path)?;
-        let mut state = self.load()?;
-        if self
+        let mut state = current.load()?;
+        if current
             .lookup(&state.view, &path)
             .ok_or(Error::NotFound)?
             .directory
@@ -788,7 +890,7 @@ impl Store {
         {
             return Err(Error::Unsupported);
         }
-        self.delete_locked(&mut state, path, actor)
+        current.delete_locked(&mut state, path, actor)
     }
     /// Delete the currently visible object held by a private open handle,
     /// refusing to delete a replacement created at its former path.
@@ -797,12 +899,13 @@ impl Store {
             return Err(Error::Corrupt);
         }
         let _serial = self.serial()?;
-        let mut state = self.load()?;
+        let current = &_serial.store;
+        let mut state = current.load()?;
         if state.generation != handle.generation {
             return Err(Error::Revision);
         }
-        let path = self.handle_path(&state, handle)?;
-        self.delete_locked(&mut state, path, actor)
+        let path = current.handle_path(&state, handle)?;
+        current.delete_locked(&mut state, path, actor)
     }
     fn delete_locked(&self, state: &mut State, path: String, actor: &str) -> Result<String> {
         if path.is_empty() {
@@ -838,13 +941,14 @@ impl Store {
     pub fn rename(&self, source: &str, target: &str, replace: bool, actor: &str) -> Result<()> {
         let _lease = self.lease()?;
         let _serial = self.serial()?;
+        let current = &_serial.store;
         let source = normalize(source)?;
         let target = normalize(target)?;
         if source.is_empty() || target.is_empty() {
             return Err(Error::Path);
         }
-        let mut state = self.load()?;
-        self.rename_locked(&mut state, source, target, replace, actor)
+        let mut state = current.load()?;
+        current.rename_locked(&mut state, source, target, replace, actor)
     }
     /// Rename by stable handle identity rather than a potentially reused path.
     pub fn rename_handle(
@@ -858,12 +962,13 @@ impl Store {
             return Err(Error::Corrupt);
         }
         let _serial = self.serial()?;
-        let mut state = self.load()?;
+        let current = &_serial.store;
+        let mut state = current.load()?;
         if state.generation != handle.generation {
             return Err(Error::Revision);
         }
-        let source = self.handle_path(&state, handle)?;
-        self.rename_locked(&mut state, source, normalize(target)?, replace, actor)
+        let source = current.handle_path(&state, handle)?;
+        current.rename_locked(&mut state, source, normalize(target)?, replace, actor)
     }
     fn rename_locked(
         &self,
@@ -978,10 +1083,11 @@ impl Store {
     pub fn snapshot(&self, expected: u64, actor: &str) -> Result<String> {
         let _maintenance = self.maintenance()?;
         let _serial = self.serial()?;
-        let mut state = self.load()?;
-        self.revision(&state, expected)?;
-        let result = self.snapshot_locked(&mut state, actor)?;
-        self.save(&state)?;
+        let current = &_serial.store;
+        let mut state = current.load()?;
+        current.revision(&state, expected)?;
+        let result = current.snapshot_locked(&mut state, actor)?;
+        current.save(&state)?;
         Ok(result)
     }
     fn snapshot_locked(&self, state: &mut State, actor: &str) -> Result<String> {
@@ -992,10 +1098,11 @@ impl Store {
     pub fn reset(&self, expected: u64, actor: &str) -> Result<String> {
         let _maintenance = self.maintenance()?;
         let _serial = self.serial()?;
-        let mut state = self.load()?;
-        self.revision(&state, expected)?;
-        let result = self.reset_locked(&mut state, actor)?;
-        self.save(&state)?;
+        let current = &_serial.store;
+        let mut state = current.load()?;
+        current.revision(&state, expected)?;
+        let result = current.reset_locked(&mut state, actor)?;
+        current.save(&state)?;
         Ok(result)
     }
     fn reset_locked(&self, state: &mut State, actor: &str) -> Result<String> {
@@ -1008,10 +1115,11 @@ impl Store {
     pub fn rollback(&self, expected: u64, snapshot_id: &str, actor: &str) -> Result<String> {
         let _maintenance = self.maintenance()?;
         let _serial = self.serial()?;
-        let mut state = self.load()?;
-        self.revision(&state, expected)?;
-        let result = self.rollback_locked(&mut state, snapshot_id, actor)?;
-        self.save(&state)?;
+        let current = &_serial.store;
+        let mut state = current.load()?;
+        current.revision(&state, expected)?;
+        let result = current.rollback_locked(&mut state, snapshot_id, actor)?;
+        current.save(&state)?;
         Ok(result)
     }
     fn rollback_locked(&self, state: &mut State, snapshot_id: &str, actor: &str) -> Result<String> {
@@ -1055,10 +1163,11 @@ impl Store {
     pub fn restore_trash(&self, expected: u64, trash_id: &str, actor: &str) -> Result<()> {
         let _maintenance = self.maintenance()?;
         let _serial = self.serial()?;
-        let mut state = self.load()?;
-        self.revision(&state, expected)?;
-        self.restore_trash_locked(&mut state, trash_id, actor)?;
-        self.save(&state)?;
+        let current = &_serial.store;
+        let mut state = current.load()?;
+        current.revision(&state, expected)?;
+        current.restore_trash_locked(&mut state, trash_id, actor)?;
+        current.save(&state)?;
         Ok(())
     }
     fn restore_trash_locked(&self, state: &mut State, trash_id: &str, actor: &str) -> Result<()> {
@@ -1136,10 +1245,11 @@ impl Store {
     pub fn purge_trash(&self, expected: u64, trash_id: &str, actor: &str) -> Result<()> {
         let _maintenance = self.maintenance()?;
         let _serial = self.serial()?;
-        let mut state = self.load()?;
-        self.revision(&state, expected)?;
-        self.purge_trash_locked(&mut state, trash_id, actor)?;
-        self.save(&state)?;
+        let current = &_serial.store;
+        let mut state = current.load()?;
+        current.revision(&state, expected)?;
+        current.purge_trash_locked(&mut state, trash_id, actor)?;
+        current.save(&state)?;
         Ok(())
     }
     fn purge_trash_locked(&self, state: &mut State, trash_id: &str, actor: &str) -> Result<()> {
@@ -1157,10 +1267,11 @@ impl Store {
     pub fn delete_snapshot(&self, expected: u64, snapshot_id: &str, actor: &str) -> Result<()> {
         let _maintenance = self.maintenance()?;
         let _serial = self.serial()?;
-        let mut state = self.load()?;
-        self.revision(&state, expected)?;
-        self.delete_snapshot_locked(&mut state, snapshot_id, actor)?;
-        self.save(&state)?;
+        let current = &_serial.store;
+        let mut state = current.load()?;
+        current.revision(&state, expected)?;
+        current.delete_snapshot_locked(&mut state, snapshot_id, actor)?;
+        current.save(&state)?;
         Ok(())
     }
     fn delete_snapshot_locked(
@@ -1220,10 +1331,11 @@ impl Store {
     ) -> Result<String> {
         let _maintenance = self.maintenance()?;
         let _serial = self.serial()?;
-        let mut state = self.load()?;
-        self.revision(&state, expected)?;
-        self.verify_view(&state.view)?;
-        let namespace = self.backup_namespace(destination)?;
+        let current = &_serial.store;
+        let mut state = current.load()?;
+        current.revision(&state, expected)?;
+        current.verify_view(&state.view)?;
+        let namespace = current.backup_namespace(destination)?;
         fs::create_dir_all(&namespace)?;
         // Count incomplete captures as well: interrupted staging cannot provide
         // unlimited storage outside the declared backup budget.
@@ -1242,14 +1354,17 @@ impl Store {
         let mut payload = BTreeMap::new();
         let mut size = 0u64;
         for hash in &hashes {
-            let bytes = bounded_read(&self.blob_path(hash)?, self.config.policy.max_file_bytes)?;
+            let bytes = bounded_read(
+                &current.blob_path(hash)?,
+                current.config.policy.max_file_bytes,
+            )?;
             if digest(&bytes) != *hash {
                 return Err(Error::Corrupt);
             }
             size = size.checked_add(bytes.len() as u64).ok_or(Error::Quota)?;
             payload.insert(hash.clone(), bytes);
         }
-        if size > self.config.policy.temporary_bytes {
+        if size > current.config.policy.temporary_bytes {
             return Err(Error::Quota);
         }
         let backup_id = id();
@@ -1273,8 +1388,8 @@ impl Store {
         }
         // Check history/metadata budget before creating any external payload.
         state.backups.insert(backup_id.clone(), backup.clone());
-        self.event(&mut state, actor, "backup", None, Some(backup_id.clone()))?;
-        self.check_budget(&state)?;
+        current.event(&mut state, actor, "backup", None, Some(backup_id.clone()))?;
+        current.check_budget(&state)?;
         let path = namespace.join(&backup_id);
         fs::create_dir(&path)?;
         fs::create_dir(path.join("blobs"))?;
@@ -1291,7 +1406,7 @@ impl Store {
             File::open(&path)?.sync_all()?;
             File::open(&namespace)?.sync_all()?;
         }
-        self.save(&state)?;
+        current.save(&state)?;
         Ok(backup_id)
     }
     /// Discover backups by their protected configured namespace, including
@@ -1300,7 +1415,8 @@ impl Store {
     pub fn list_backups(&self, destination: &BackupDestination) -> Result<Vec<Backup>> {
         let _lease = self.lease()?;
         let _serial = self.serial()?;
-        let namespace = self.backup_namespace(destination)?;
+        let current = &_serial.store;
+        let namespace = current.backup_namespace(destination)?;
         let mut backups = Vec::new();
         if !namespace.exists() {
             return Ok(backups);
@@ -1314,13 +1430,14 @@ impl Store {
             }
             let path = entry.path().join("manifest.json");
             if entry.path().join("deleted.json").exists() {
-                self.backup_deletion(destination, &entry.file_name().to_string_lossy())?;
+                current.backup_deletion(destination, &entry.file_name().to_string_lossy())?;
                 continue;
             }
             if !path.exists() {
                 continue;
             }
-            backups.push(self.backup_manifest(destination, &entry.file_name().to_string_lossy())?);
+            backups
+                .push(current.backup_manifest(destination, &entry.file_name().to_string_lossy())?);
         }
         backups.sort_by(|a, b| a.id.cmp(&b.id));
         Ok(backups)
@@ -1378,11 +1495,12 @@ impl Store {
     ) -> Result<String> {
         let _maintenance = self.maintenance()?;
         let _serial = self.serial()?;
-        let mut state = self.load()?;
-        self.revision(&state, expected)?;
+        let current = &_serial.store;
+        let mut state = current.load()?;
+        current.revision(&state, expected)?;
         let result =
-            self.restore_backup_prepared(&mut state, destination, backup_id, actor, true)?;
-        self.save(&state)?;
+            current.restore_backup_prepared(&mut state, destination, backup_id, actor, true)?;
+        current.save(&state)?;
         Ok(result)
     }
     fn restore_backup_prepared(
@@ -1491,8 +1609,9 @@ impl Store {
         use OpenDisposition::*;
         let lease = self.lease()?;
         let _serial = self.serial()?;
+        let current = &_serial.store;
         let path = normalize(path)?;
-        let mut state = self.load()?;
+        let mut state = current.load()?;
         let existing = if path.is_empty() {
             Some(Entry {
                 object_id: "root".into(),
@@ -1502,7 +1621,7 @@ impl Store {
                 digest: None,
             })
         } else {
-            self.lookup(&state.view, &path).cloned()
+            current.lookup(&state.view, &path).cloned()
         };
         if existing
             .as_ref()
@@ -1536,18 +1655,18 @@ impl Store {
                 return Err(Error::Unsupported);
             }
             if directory {
-                if !self.parent_exists(&state.view, &path) {
+                if !current.parent_exists(&state.view, &path) {
                     return Err(Error::NotFound);
                 }
                 state.view.upper.insert(path.clone(), candidate.clone());
-                self.check_budget(&state)?;
+                current.check_budget(&state)?;
             } else {
                 // Preserve identity for existing opens. This keeps other
                 // handles coherent when a client truncates a lower file.
                 if action == OpenAction::Created {
                     state.view.upper.insert(path.clone(), candidate.clone());
                 }
-                self.publish_file(&mut state, &path, &[])?;
+                current.publish_file(&mut state, &path, &[])?;
             }
             let operation = match action {
                 OpenAction::Created => "create",
@@ -1555,13 +1674,14 @@ impl Store {
                 OpenAction::Overwritten => "overwrite",
                 OpenAction::Opened => unreachable!(),
             };
-            self.event(&mut state, actor, operation, Some(path.clone()), None)?;
-            self.save(&state)?;
+            current.event(&mut state, actor, operation, Some(path.clone()), None)?;
+            current.save(&state)?;
         }
         let entry = if path.is_empty() {
             existing.ok_or(Error::NotFound)?
         } else {
-            self.lookup(&state.view, &path)
+            current
+                .lookup(&state.view, &path)
                 .cloned()
                 .ok_or(Error::NotFound)?
         };
@@ -1583,7 +1703,8 @@ impl Store {
             return Err(Error::Corrupt);
         }
         let _serial = self.serial()?;
-        let state = self.load()?;
+        let current = &_serial.store;
+        let state = current.load()?;
         if handle.generation != state.generation {
             return Err(Error::Revision);
         }
@@ -1596,8 +1717,9 @@ impl Store {
                 digest: None,
             });
         }
-        let path = self.handle_path(&state, handle)?;
-        self.lookup(&state.view, &path)
+        let path = current.handle_path(&state, handle)?;
+        current
+            .lookup(&state.view, &path)
             .cloned()
             .ok_or(Error::NotFound)
     }
@@ -1610,26 +1732,27 @@ impl Store {
         if !handle.writable || handle.directory {
             return Err(Error::Unsupported);
         }
-        if size > self.config.policy.max_file_bytes {
+        let _serial = self.serial()?;
+        let current = &_serial.store;
+        if size > current.config.policy.max_file_bytes {
             return Err(Error::Quota);
         }
-        let _serial = self.serial()?;
-        let mut state = self.load()?;
+        let mut state = current.load()?;
         if handle.generation != state.generation {
             return Err(Error::Revision);
         }
-        let path = self.handle_path(&state, handle)?;
-        let mut content = self.bytes(&state, &path)?;
+        let path = current.handle_path(&state, handle)?;
+        let mut content = current.bytes(&state, &path)?;
         content.resize(usize::try_from(size).map_err(|_| Error::Quota)?, 0);
-        self.publish_file(&mut state, &path, &content)?;
-        self.event(
+        current.publish_file(&mut state, &path, &content)?;
+        current.event(
             &mut state,
             actor,
             "resize",
             Some(path),
             Some(handle.object_id.clone()),
         )?;
-        self.save(&state)
+        current.save(&state)
     }
 
     /// Open a coherent path handle. All subsequent reads resolve the current
@@ -1637,19 +1760,22 @@ impl Store {
     pub fn open_handle(self: &Arc<Self>, path: &str, writable: bool) -> Result<Handle> {
         let lease = self.lease()?;
         let _serial = self.serial()?;
+        let current = &_serial.store;
         let path = normalize(path)?;
-        let state = self.load()?;
+        let state = current.load()?;
         let directory = if path.is_empty() {
             true
         } else {
-            self.lookup(&state.view, &path)
+            current
+                .lookup(&state.view, &path)
                 .ok_or(Error::NotFound)?
                 .directory
         };
         let object_id = if path.is_empty() {
             "root".to_string()
         } else {
-            self.lookup(&state.view, &path)
+            current
+                .lookup(&state.view, &path)
                 .ok_or(Error::NotFound)?
                 .object_id
                 .clone()
@@ -1669,12 +1795,13 @@ impl Store {
             return Err(Error::Corrupt);
         }
         let _serial = self.serial()?;
-        let state = self.load()?;
+        let current = &_serial.store;
+        let state = current.load()?;
         if handle.generation != state.generation {
             return Err(Error::Revision);
         }
-        let path = self.handle_path(&state, handle)?;
-        let bytes = self.bytes(&state, &path)?;
+        let path = current.handle_path(&state, handle)?;
+        let bytes = current.bytes(&state, &path)?;
         let start = usize::try_from(offset)
             .map_err(|_| Error::Quota)?
             .min(bytes.len());
@@ -1694,21 +1821,22 @@ impl Store {
             return Err(Error::Unsupported);
         }
         let _serial = self.serial()?;
-        let mut state = self.load()?;
+        let current = &_serial.store;
+        let mut state = current.load()?;
         if handle.generation != state.generation {
             return Err(Error::Revision);
         }
         let end = offset.checked_add(data.len() as u64).ok_or(Error::Quota)?;
-        if end > self.config.policy.max_file_bytes {
+        if end > current.config.policy.max_file_bytes {
             return Err(Error::Quota);
         }
-        let path = self.handle_path(&state, handle)?;
-        let mut bytes = self.bytes(&state, &path)?;
+        let path = current.handle_path(&state, handle)?;
+        let mut bytes = current.bytes(&state, &path)?;
         bytes.resize(bytes.len().max(end as usize), 0);
         bytes[offset as usize..end as usize].copy_from_slice(data);
-        self.publish_file(&mut state, &path, &bytes)?;
-        self.event(&mut state, actor, "write", Some(path), None)?;
-        self.save(&state)
+        current.publish_file(&mut state, &path, &bytes)?;
+        current.event(&mut state, actor, "write", Some(path), None)?;
+        current.save(&state)
     }
     fn handle_path(&self, state: &State, handle: &Handle) -> Result<String> {
         if self.namespace != handle.store.namespace {

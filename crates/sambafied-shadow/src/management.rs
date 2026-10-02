@@ -197,17 +197,18 @@ impl Store {
         action.validate()?;
         let _maintenance = self.maintenance()?;
         let _serial = self.serial()?;
-        let original = self.load()?;
-        self.revision(&original, expected)?;
-        let fingerprint = self.action_fingerprint(&original, catalog, &action, None)?;
+        let current = &_serial.store;
+        let original = current.load()?;
+        current.revision(&original, expected)?;
+        let fingerprint = current.action_fingerprint(&original, catalog, &action, None)?;
         let mut staged = original.clone();
         match &action {
             Action::Export => {
-                let capture = self.prepare_artifact(&staged, &id(), actor, now())?;
+                let capture = current.prepare_artifact(&staged, &id(), actor, now())?;
                 staged
                     .artifacts
                     .insert(capture.artifact.id.clone(), capture.artifact.clone());
-                self.event(
+                current.event(
                     &mut staged,
                     actor,
                     "export",
@@ -216,46 +217,46 @@ impl Store {
                 )?;
             }
             Action::Snapshot => {
-                self.snapshot_locked(&mut staged, actor)?;
+                current.snapshot_locked(&mut staged, actor)?;
             }
             Action::Reset => {
-                self.reset_locked(&mut staged, actor)?;
+                current.reset_locked(&mut staged, actor)?;
             }
             Action::Rollback { snapshot_id } => {
-                self.rollback_locked(&mut staged, snapshot_id, actor)?;
+                current.rollback_locked(&mut staged, snapshot_id, actor)?;
             }
             Action::RestoreTrash { trash_id } => {
                 if planned {
-                    self.retain(&mut staged, true)?;
+                    current.retain(&mut staged, true)?;
                     staged.generation = id();
                 }
-                self.restore_trash_prepared(&mut staged, trash_id, actor, false)?;
+                current.restore_trash_prepared(&mut staged, trash_id, actor, false)?;
             }
             Action::PurgeTrash { trash_id } => {
-                self.purge_trash_locked(&mut staged, trash_id, actor)?;
+                current.purge_trash_locked(&mut staged, trash_id, actor)?;
             }
             Action::DeleteSnapshot { snapshot_id } => {
-                self.delete_snapshot_locked(&mut staged, snapshot_id, actor)?;
+                current.delete_snapshot_locked(&mut staged, snapshot_id, actor)?;
             }
             Action::Backup { destination_id } => {
-                let capture = self.prepare_capture(
+                let capture = current.prepare_capture(
                     &staged,
-                    self.destination(catalog, destination_id)?,
+                    current.destination(catalog, destination_id)?,
                     &id(),
                     now(),
                 )?;
                 staged
                     .backups
                     .insert(capture.backup.id.clone(), capture.backup.clone());
-                self.event(&mut staged, actor, "backup", None, Some(capture.backup.id))?;
+                current.event(&mut staged, actor, "backup", None, Some(capture.backup.id))?;
             }
             Action::RestoreBackup {
                 destination_id,
                 backup_id,
             } => {
-                self.restore_backup_prepared(
+                current.restore_backup_prepared(
                     &mut staged,
-                    self.destination(catalog, destination_id)?,
+                    current.destination(catalog, destination_id)?,
                     backup_id,
                     actor,
                     false,
@@ -265,11 +266,11 @@ impl Store {
                 destination_id,
                 backup_id,
             } => {
-                let destination = self.destination(catalog, destination_id)?;
-                let backup = self.backup_manifest(destination, backup_id)?;
-                self.check_deletion_budget(destination, &backup, &id())?;
+                let destination = current.destination(catalog, destination_id)?;
+                let backup = current.backup_manifest(destination, backup_id)?;
+                current.check_deletion_budget(destination, &backup, &id())?;
                 staged.backups.remove(backup_id);
-                self.event(
+                current.event(
                     &mut staged,
                     actor,
                     "delete-backup",
@@ -278,8 +279,8 @@ impl Store {
                 )?;
             }
         }
-        self.check_budget(&staged)?;
-        let paths: BTreeSet<_> = self
+        current.check_budget(&staged)?;
+        let paths: BTreeSet<_> = current
             .base
             .keys()
             .chain(original.view.upper.keys())
@@ -287,7 +288,9 @@ impl Store {
             .collect();
         let affected_entries = paths
             .iter()
-            .filter(|path| self.lookup(&original.view, path) != self.lookup(&staged.view, path))
+            .filter(|path| {
+                current.lookup(&original.view, path) != current.lookup(&staged.view, path)
+            })
             .count();
         let active_bytes_after = staged.view.upper.values().map(|e| e.size).sum();
         let retained_bytes_after: u64 = staged
@@ -304,7 +307,7 @@ impl Store {
             )
             .sum();
         let retained_bytes_after =
-            retained_bytes_after + self.artifact_usage(&staged)?.values().sum::<u64>();
+            retained_bytes_after + current.artifact_usage(&staged)?.values().sum::<u64>();
         Ok(ActionImpact {
             revision: original.revision,
             generation: original.generation,
@@ -315,7 +318,7 @@ impl Store {
                 Action::Reset | Action::Rollback { .. } | Action::RestoreBackup { .. }
             ) || (planned
                 && matches!(action, Action::RestoreTrash { .. })))
-            .then_some(self.config.policy.recovery_protection_seconds),
+            .then_some(current.config.policy.recovery_protection_seconds),
             physical_reclamation_deferred: matches!(
                 action,
                 Action::PurgeTrash { .. }
@@ -388,7 +391,8 @@ impl Store {
         action.validate()?;
         let _lease = self.lease()?;
         let _serial = self.serial()?;
-        let mut state = self.load()?;
+        let current = &_serial.store;
+        let mut state = current.load()?;
         let key_digest = digest(key.as_bytes());
         if let Some(job) = state
             .jobs
@@ -406,9 +410,9 @@ impl Store {
                 replayed: true,
             });
         }
-        self.revision(&state, expected)?;
+        current.revision(&state, expected)?;
         if let Some(binding) = &binding
-            && self.action_fingerprint(&state, catalog, &action, None)?
+            && current.action_fingerprint(&state, catalog, &action, None)?
                 != binding.source_fingerprint
         {
             return Err(Error::Revision);
@@ -431,7 +435,7 @@ impl Store {
             request_binding: binding,
         };
         state.jobs.insert(job.id.clone(), job.clone());
-        self.save(&state)?;
+        current.save(&state)?;
         Ok(Submission {
             job,
             replayed: false,
@@ -460,7 +464,8 @@ impl Store {
         action.validate()?;
         let _lease = self.lease()?;
         let _serial = self.serial()?;
-        let state = self.load()?;
+        let current = &_serial.store;
+        let state = current.load()?;
         let key_digest = digest(key.as_bytes());
         let Some(job) = state
             .jobs
@@ -486,7 +491,9 @@ impl Store {
     pub fn job(&self, job_id: &str, actor: &str) -> Result<Job> {
         let _lease = self.lease()?;
         let _serial = self.serial()?;
-        self.load()?
+        let current = &_serial.store;
+        current
+            .load()?
             .jobs
             .get(job_id)
             .filter(|j| j.actor == actor)
@@ -516,7 +523,8 @@ impl Store {
     {
         let _maintenance = self.maintenance()?;
         let _serial = self.serial()?;
-        let mut original = self.load()?;
+        let current = &_serial.store;
+        let mut original = current.load()?;
         let mut job = original
             .jobs
             .get(job_id)
@@ -539,11 +547,11 @@ impl Store {
             );
         let operation = (|| {
             allowed?;
-            self.revision(&original, job.expected_revision)?;
+            current.revision(&original, job.expected_revision)?;
             if let Some(binding) = &job.request_binding {
                 let mut source = original.clone();
                 source.jobs.remove(job_id);
-                if self.action_fingerprint(&source, catalog, &job.action, Some(job_id))?
+                if current.action_fingerprint(&source, catalog, &job.action, Some(job_id))?
                     != binding.source_fingerprint
                 {
                     return Err(Error::Revision);
@@ -552,7 +560,7 @@ impl Store {
             job.status = JobStatus::Running;
             job.updated_at = now();
             original.jobs.insert(job.id.clone(), job.clone());
-            self.save(&original)?;
+            current.save(&original)?;
             let mut staged = original.clone();
             let history_start = staged.history.len();
             let mut result = JobResult {
@@ -568,12 +576,13 @@ impl Store {
             let mut export = None;
             match &job.action {
                 Action::Export => {
-                    let capture = self.prepare_artifact(&staged, &job.id, actor, job.created_at)?;
+                    let capture =
+                        current.prepare_artifact(&staged, &job.id, actor, job.created_at)?;
                     result.artifact_id = Some(capture.artifact.id.clone());
                     staged
                         .artifacts
                         .insert(capture.artifact.id.clone(), capture.artifact.clone());
-                    self.event(
+                    current.event(
                         &mut staged,
                         actor,
                         "export",
@@ -583,32 +592,32 @@ impl Store {
                     export = Some(capture);
                 }
                 Action::Snapshot => {
-                    result.snapshot_id = Some(self.snapshot_locked(&mut staged, actor)?)
+                    result.snapshot_id = Some(current.snapshot_locked(&mut staged, actor)?)
                 }
                 Action::Reset => {
-                    result.recovery_snapshot_id = Some(self.reset_locked(&mut staged, actor)?)
+                    result.recovery_snapshot_id = Some(current.reset_locked(&mut staged, actor)?)
                 }
                 Action::Rollback { snapshot_id } => {
                     result.recovery_snapshot_id =
-                        Some(self.rollback_locked(&mut staged, snapshot_id, actor)?)
+                        Some(current.rollback_locked(&mut staged, snapshot_id, actor)?)
                 }
                 Action::RestoreTrash { trash_id } => {
                     if job.request_binding.is_some() {
-                        result.recovery_snapshot_id = Some(self.retain(&mut staged, true)?);
+                        result.recovery_snapshot_id = Some(current.retain(&mut staged, true)?);
                         staged.generation = id();
                     }
-                    self.restore_trash_locked(&mut staged, trash_id, actor)?
+                    current.restore_trash_locked(&mut staged, trash_id, actor)?
                 }
                 Action::PurgeTrash { trash_id } => {
-                    self.purge_trash_locked(&mut staged, trash_id, actor)?
+                    current.purge_trash_locked(&mut staged, trash_id, actor)?
                 }
                 Action::DeleteSnapshot { snapshot_id } => {
-                    self.delete_snapshot_locked(&mut staged, snapshot_id, actor)?
+                    current.delete_snapshot_locked(&mut staged, snapshot_id, actor)?
                 }
                 Action::Backup { destination_id } => {
-                    let prepared = self.prepare_capture(
+                    let prepared = current.prepare_capture(
                         &staged,
-                        self.destination(catalog, destination_id)?,
+                        current.destination(catalog, destination_id)?,
                         &job.id,
                         job.created_at,
                     )?;
@@ -616,7 +625,7 @@ impl Store {
                     staged
                         .backups
                         .insert(prepared.backup.id.clone(), prepared.backup.clone());
-                    self.event(
+                    current.event(
                         &mut staged,
                         actor,
                         "backup",
@@ -630,9 +639,9 @@ impl Store {
                     backup_id,
                 } => {
                     result.backup_id = Some(backup_id.clone());
-                    result.recovery_snapshot_id = Some(self.restore_backup_prepared(
+                    result.recovery_snapshot_id = Some(current.restore_backup_prepared(
                         &mut staged,
-                        self.destination(catalog, destination_id)?,
+                        current.destination(catalog, destination_id)?,
                         backup_id,
                         actor,
                         true,
@@ -642,18 +651,18 @@ impl Store {
                     destination_id,
                     backup_id,
                 } => {
-                    let backup = self.backup_manifest_for_job(
-                        self.destination(catalog, destination_id)?,
+                    let backup = current.backup_manifest_for_job(
+                        current.destination(catalog, destination_id)?,
                         backup_id,
                         Some(job_id),
                     )?;
-                    self.check_deletion_budget(
-                        self.destination(catalog, destination_id)?,
+                    current.check_deletion_budget(
+                        current.destination(catalog, destination_id)?,
                         &backup,
                         job_id,
                     )?;
                     staged.backups.remove(backup_id);
-                    self.event(
+                    current.event(
                         &mut staged,
                         actor,
                         "delete-backup",
@@ -664,20 +673,20 @@ impl Store {
                     deletion = Some((destination_id.clone(), backup));
                 }
             }
-            self.check_budget(&staged)?;
+            current.check_budget(&staged)?;
             authorize(&job)?;
             if let Some(export) = &export {
                 external_started = true;
-                self.publish_artifact(export)?;
+                current.publish_artifact(export)?;
             }
             if let Some(capture) = &capture {
                 external_started = true;
-                self.publish_capture(capture)?;
+                current.publish_capture(capture)?;
             }
             if let Some((destination_id, backup)) = &deletion {
                 external_started = true;
-                self.publish_backup_deletion(
-                    self.destination(catalog, destination_id)?,
+                current.publish_backup_deletion(
+                    current.destination(catalog, destination_id)?,
                     backup,
                     job_id,
                 )?;
@@ -692,7 +701,7 @@ impl Store {
             completed.updated_at = now();
             completed.result = Some(result);
             staged.jobs.insert(completed.id.clone(), completed.clone());
-            self.save(&staged)?;
+            current.save(&staged)?;
             Ok(completed)
         })();
         match operation {
@@ -700,8 +709,8 @@ impl Store {
             Err(error) => {
                 // A publication may succeed before directory sync reports an
                 // I/O failure. Never overwrite an already committed success.
-                let current = self.load()?;
-                if let Some(committed) = current
+                let committed_state = current.load()?;
+                if let Some(committed) = committed_state
                     .jobs
                     .get(job_id)
                     .filter(|j| j.status == JobStatus::Succeeded)
@@ -717,7 +726,7 @@ impl Store {
                 job.updated_at = now();
                 job.error_code = Some(error_code(&error).into());
                 original.jobs.insert(job.id.clone(), job.clone());
-                self.save(&original)?;
+                current.save(&original)?;
                 Ok(job)
             }
         }
