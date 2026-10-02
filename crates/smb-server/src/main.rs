@@ -11,6 +11,7 @@ pub mod srvsvc;
 pub mod state;
 
 use std::collections::HashMap;
+use std::io::Read;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -36,13 +37,17 @@ struct Args {
     #[arg(short = 'p', long = "port", default_value_t = DEFAULT_PORT)]
     port: u16,
 
-    /// Publish a share: NAME=PATH (repeatable; defaults to public=$PWD).
-    #[arg(short = 's', long = "share", value_name = "NAME=PATH")]
-    shares: Vec<String>,
+    /// Explicit SMB bind address.
+    #[arg(long)]
+    bind: Option<SocketAddr>,
 
-    /// Add an account USER:PASSWORD (repeatable; empty DB maps all users to guest).
-    #[arg(short = 'u', long = "user", value_name = "USER:PASSWORD")]
-    users: Vec<String>,
+    /// Receive bounded account JSON through a private stdin pipe.
+    #[arg(long, required = true)]
+    users_stdin: bool,
+
+    /// Publish an explicitly configured share: NAME=PATH (repeatable).
+    #[arg(short = 's', long = "share", value_name = "NAME=PATH", required = true)]
+    shares: Vec<String>,
 
     /// Log filter (tracing EnvFilter syntax); RUST_LOG overrides this value.
     #[arg(long = "log", default_value = "info")]
@@ -99,11 +104,6 @@ fn main() {
         .with_target(false)
         .init();
 
-    if args.shares.is_empty() {
-        let cwd = std::env::current_dir().unwrap_or_default();
-        tracing::warn!(path = %cwd.display(), "no --share given; publishing cwd as 'public'");
-    }
-
     let share_map = build_shares(&args);
     let users = build_users(&args);
 
@@ -114,7 +114,7 @@ fn main() {
         domain: "WORKGROUP".into(),
         server_name: "RUSTSMB".into(),
         users,
-        allow_guest: true,
+        allow_guest: false,
         require_signing: args.require_signing,
         encrypt: args.encrypt,
         locks: Arc::new(state::LockManager::new()),
@@ -130,10 +130,10 @@ fn main() {
     // one thread via io_uring, so per-connection state stays `!Send` and never
     // crosses threads. (Per-core scaling with SO_REUSEPORT comes later.)
     tokio_uring::start(async move {
-        let listener = match tokio_uring::net::TcpListener::bind(SocketAddr::from((
-            [0, 0, 0, 0],
-            args.port,
-        ))) {
+        let listener = match tokio_uring::net::TcpListener::bind(
+            args.bind
+                .unwrap_or(SocketAddr::from(([0, 0, 0, 0], args.port))),
+        ) {
             Ok(l) => l,
             Err(e) => {
                 tracing::error!(port = args.port, error = %e, "failed to bind");
@@ -157,7 +157,8 @@ fn main() {
             let durables = shared.durables.clone();
             tokio_uring::spawn(async move {
                 loop {
-                    tokio::time::sleep(std::time::Duration::from_secs(DURABLE_SWEEP_INTERVAL_SECS)).await;
+                    tokio::time::sleep(std::time::Duration::from_secs(DURABLE_SWEEP_INTERVAL_SECS))
+                        .await;
                     let _ = durables.sweep_expired(state::now_ms()).await;
                 }
             });
@@ -175,7 +176,8 @@ fn main() {
                         let transport = Box::new(smb_server_transport::tcp::TcpTransport::new(
                             stream,
                             peer.to_string(),
-                        )) as Box<dyn smb_server_transport::Transport>;
+                        ))
+                            as Box<dyn smb_server_transport::Transport>;
                         dispatch::serve_client(srv, transport).await;
                         tracing::debug!("client disconnected");
                     });
@@ -192,30 +194,44 @@ fn build_shares(args: &Args) -> HashMap<String, state::Share> {
     for spec in &args.shares {
         match spec.split_once('=') {
             Some((name, path)) => shares.push((name.to_string(), path.to_string())),
-            None => shares.push(("public".into(), spec.clone())),
+            None => {
+                eprintln!("Share requires explicit NAME=PATH");
+                std::process::exit(2);
+            }
         }
-    }
-    if shares.is_empty() {
-        let cwd = std::env::current_dir().unwrap_or_default();
-        shares.push(("public".into(), cwd.to_string_lossy().into_owned()));
     }
 
     let mut map = HashMap::new();
-    let encrypt_set: std::collections::HashSet<String> =
-        args.encrypt_shares.iter().map(|s| s.to_lowercase()).collect();
-    let compress_set: std::collections::HashSet<String> =
-        args.compress_shares.iter().map(|s| s.to_lowercase()).collect();
+    let encrypt_set: std::collections::HashSet<String> = args
+        .encrypt_shares
+        .iter()
+        .map(|s| s.to_lowercase())
+        .collect();
+    let compress_set: std::collections::HashSet<String> = args
+        .compress_shares
+        .iter()
+        .map(|s| s.to_lowercase())
+        .collect();
     let ca_set: std::collections::HashSet<String> =
         args.ca_shares.iter().map(|s| s.to_lowercase()).collect();
     for (name, root) in shares {
         let lname = name.to_lowercase();
-        let vfs: Arc<dyn smb_server_vfs::Vfs> = Arc::new(smb_server_backend_posix::PosixVfs::new(root.clone()));
+        let vfs: Arc<dyn smb_server_vfs::Vfs> =
+            Arc::new(smb_server_backend_posix::PosixVfs::new(root.clone()));
         let encrypt = encrypt_set.contains(&lname);
         let compress = compress_set.contains(&lname);
         let ca = ca_set.contains(&lname);
         map.insert(
             lname.clone(),
-            state::Share { name, root: root.into(), vfs, is_ipc: false, encrypt, compress, ca },
+            state::Share {
+                name,
+                root: root.into(),
+                vfs,
+                is_ipc: false,
+                encrypt,
+                compress,
+                ca,
+            },
         );
     }
     // Virtual IPC$ share for named-pipe traffic.
@@ -234,17 +250,67 @@ fn build_shares(args: &Args) -> HashMap<String, state::Share> {
     map
 }
 
-/// Parse USER:PASSWORD account specs into the user database.
+/// Parse account JSON received through the private stdin channel.
 fn build_users(args: &Args) -> HashMap<String, String> {
+    let mut raw = String::new();
+    if !args.users_stdin
+        || std::io::stdin()
+            .take(65537)
+            .read_to_string(&mut raw)
+            .is_err()
+        || raw.len() > 65536
+    {
+        eprintln!("Invalid bounded account input");
+        std::process::exit(2);
+    }
+    let users = match parse_users(&raw) {
+        Ok(users) => users,
+        Err(()) => {
+            eprintln!("Invalid account JSON");
+            std::process::exit(2);
+        }
+    };
+    users
+}
+
+fn parse_users(raw: &str) -> Result<HashMap<String, String>, ()> {
+    if raw.len() > 65536 {
+        return Err(());
+    }
+    let input: HashMap<String, String> = serde_json::from_str(raw).map_err(|_| ())?;
+    if input.is_empty() || input.len() > 64 {
+        return Err(());
+    }
     let mut users = HashMap::new();
-    for spec in &args.users {
-        if let Some((user, pass)) = spec.split_once(':') {
-            users.insert(user.to_lowercase(), pass.to_string());
-        } else {
-            tracing::warn!(spec = %spec, "ignoring malformed --user (expected USER:PASSWORD)");
+    for (user, password) in input {
+        if user.is_empty()
+            || password.is_empty()
+            || user.len() > 128
+            || password.len() > 1024
+            || users.insert(user.to_lowercase(), password).is_some()
+        {
+            return Err(());
         }
     }
-    users
+    Ok(users)
+}
+
+#[cfg(test)]
+mod sambafied_tests {
+    use super::parse_users;
+    #[test]
+    fn explicit_accounts_are_bounded_and_case_unique() {
+        assert!(parse_users("{}").is_err());
+        assert!(parse_users(r#"{"Alice":"x","alice":"y"}"#).is_err());
+        assert!(parse_users(r#"{"alice":""}"#).is_err());
+        assert_eq!(
+            parse_users(r#"{"Alice":"x"}"#)
+                .unwrap()
+                .get("alice")
+                .unwrap(),
+            "x"
+        );
+    }
 }
 
 /// Build the durable-handle store from `--handle-store`. `redb` persists across
@@ -281,7 +347,9 @@ fn spawn_metrics_endpoint(addr: SocketAddr) {
                 };
                 tracing::info!(%addr, "prometheus metrics on http://{addr}/metrics");
                 loop {
-                    let Ok((sock, _)) = listener.accept().await else { continue };
+                    let Ok((sock, _)) = listener.accept().await else {
+                        continue;
+                    };
                     let text = handle.render();
                     tokio_uring::spawn(async move {
                         // Drain the request line/headers before responding.

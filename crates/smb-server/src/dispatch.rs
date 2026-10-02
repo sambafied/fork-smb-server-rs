@@ -105,7 +105,7 @@ pub async fn serve_client(server: Arc<crate::state::ServerShared>, transport: Bo
 
     {
         let challenge = rand_challenge();
-        let mut conn = ConnState::new(challenge);
+        let conn = ConnState::new(challenge);
         let mut smb2_conn: Option<crate::smb2::Smb2Conn> = None;
 
         loop {
@@ -169,17 +169,17 @@ pub async fn serve_client(server: Arc<crate::state::ServerShared>, transport: Bo
                     // buffer. compress_message* wraps only when it shrinks.
                     if let Some(algo) = c2.compress_algo
                         && c2.compress_response
-                            && resp.first() != Some(&PROTO_ID_ENCRYPTED)
-                        {
-                            let packed = if c2.compress_chained {
-                                smb_server_proto_smb2::compress::compress_message_chained(&resp, algo)
-                            } else {
-                                smb_server_proto_smb2::compress::compress_message(&resp, algo)
-                            };
-                            if let Some(packed) = packed {
-                                resp = packed;
-                            }
+                        && resp.first() != Some(&PROTO_ID_ENCRYPTED)
+                    {
+                        let packed = if c2.compress_chained {
+                            smb_server_proto_smb2::compress::compress_message_chained(&resp, algo)
+                        } else {
+                            smb_server_proto_smb2::compress::compress_message(&resp, algo)
+                        };
+                        if let Some(packed) = packed {
+                            resp = packed;
                         }
+                    }
                     histogram!("smb_frame_duration_us").record(start.elapsed().as_micros() as f64);
                     counter!("smb_responses_total").increment(1);
                     if out_tx.send(resp).await.is_err() {
@@ -195,11 +195,8 @@ pub async fn serve_client(server: Arc<crate::state::ServerShared>, transport: Bo
                 continue;
             }
 
-            // SMB1 frames.
-            if let Some(resp) = process_frame(&server, &mut conn, &frame.0).await
-                && out_tx.send(resp).await.is_err() {
-                    break;
-                }
+            // Initial Sambafied listener is modern-only; legacy qualification is separate.
+            break;
         }
 
         // Connection closing: drop any byte-range locks this session held.
@@ -236,9 +233,10 @@ pub fn rand_bytes(n: usize) -> Vec<u8> {
     use std::io::Read;
     let mut buf = vec![0u8; n];
     if let Ok(mut f) = std::fs::File::open("/dev/urandom")
-        && f.read_exact(&mut buf).is_ok() {
-            return buf;
-        }
+        && f.read_exact(&mut buf).is_ok()
+    {
+        return buf;
+    }
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -255,9 +253,10 @@ fn rand_challenge() -> [u8; 8] {
     use std::io::Read;
     let mut b = [0u8; 8];
     if let Ok(mut f) = std::fs::File::open("/dev/urandom")
-        && f.read_exact(&mut b).is_ok() {
-            return b;
-        }
+        && f.read_exact(&mut b).is_ok()
+    {
+        return b;
+    }
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -291,11 +290,12 @@ pub(crate) async fn process_frame(
             .windows(smb_server_proto_smb2::SMB2_MAGIC.len())
             .any(|w| w == smb_server_proto_smb2::SMB2_MAGIC)
             || buf.windows(b"SMB 2.".len()).any(|w| w == b"SMB 2."))
-        && let Some(resp) = crate::smb2::handle_multiprotocol_negotiate(buf, &server.guid) {
-            conn.upgraded_smb2 = true;
-            tracing::info!("client upgraded to SMB2 via multi-protocol negotiate");
-            return Some(resp);
-        }
+        && let Some(resp) = crate::smb2::handle_multiprotocol_negotiate(buf, &server.guid)
+    {
+        conn.upgraded_smb2 = true;
+        tracing::info!("client upgraded to SMB2 via multi-protocol negotiate");
+        return Some(resp);
+    }
 
     let wct = buf[wc_off] as usize;
     let _bc_off_abs = wc_off + 1 + wct * consts::WORD_LEN;
