@@ -133,7 +133,9 @@ fn error(error: sambafied_shadow::Error) -> VfsError {
         Path => VfsError::InvalidArgument,
         Unsupported => VfsError::NotSupported,
         Busy => VfsError::SharingViolation,
-        Revision | Quota | Corrupt | Retention | Json(_) => VfsError::AccessDenied,
+        Revision | Quota | Corrupt | Retention | Json(_) | Denied | Idempotency => {
+            VfsError::AccessDenied
+        }
     }
 }
 fn meta(entry: &sambafied_shadow::Entry) -> FileMeta {

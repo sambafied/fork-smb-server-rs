@@ -24,6 +24,9 @@ jobs:
         with:
           toolchain: 1.98.1
 
+      - name: Run management receipt contract
+        run: cargo test --locked -p sambafied-shadow --test management_receipts
+
       - name: Check server package with the lockfile
         run: cargo check --locked -p smb-server
 

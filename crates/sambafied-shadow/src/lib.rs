@@ -6,6 +6,9 @@
 //! counterpart. The lease works across the API and SMB engine processes.
 #![forbid(unsafe_code)]
 
+mod management;
+pub use management::{Action, Job, JobResult, JobStatus, Submission};
+
 use atomic_write_file::AtomicWriteFile;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -47,6 +50,10 @@ pub enum Error {
     Retention,
     #[error("operation is not supported")]
     Unsupported,
+    #[error("management authorization denied")]
+    Denied,
+    #[error("idempotency key was used with different inputs")]
+    Idempotency,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -177,9 +184,12 @@ pub struct Event {
     pub path: Option<String>,
     pub object_id: Option<String>,
     pub at: u64,
+    #[serde(default)]
+    pub job_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct State {
     pub schema: u32,
     pub identity: Identity,
@@ -192,6 +202,8 @@ pub struct State {
     #[serde(default)]
     pub backups: BTreeMap<String, Backup>,
     pub history: Vec<Event>,
+    #[serde(default)]
+    pub jobs: BTreeMap<String, Job>,
 }
 
 #[derive(Debug)]
@@ -395,11 +407,16 @@ impl Store {
         });
         let _serial = store.serial()?;
         if store.state_path().exists() {
-            let state = store.load()?;
+            let mut state = store.load()?;
+            if state.schema == 1 {
+                let _maintenance = store.maintenance()?;
+                state.schema = 2;
+                store.save(&state)?;
+            }
             store.collect_blobs(&state)?;
         } else {
             store.save(&State {
-                schema: 1,
+                schema: 2,
                 identity: store.config.identity.clone(),
                 base_digest: store.base_digest.clone(),
                 generation: id(),
@@ -409,6 +426,7 @@ impl Store {
                 trash: BTreeMap::new(),
                 backups: BTreeMap::new(),
                 history: Vec::new(),
+                jobs: BTreeMap::new(),
             })?;
         }
         drop(_serial);
@@ -433,7 +451,8 @@ impl Store {
     fn load(&self) -> Result<State> {
         let state: State =
             serde_json::from_slice(&bounded_read(&self.state_path(), 16 * 1024 * 1024)?)?;
-        if state.schema != 1
+        if !matches!(state.schema, 1 | 2)
+            || (state.schema == 1 && !state.jobs.is_empty())
             || state.identity != self.config.identity
             || state.base_digest != self.base_digest
         {
@@ -638,6 +657,7 @@ impl Store {
             path,
             object_id,
             at: now(),
+            job_id: None,
         });
         Ok(())
     }
@@ -917,9 +937,13 @@ impl Store {
         let _serial = self.serial()?;
         let mut state = self.load()?;
         self.revision(&state, expected)?;
-        let snapshot = self.retain(&mut state, false)?;
-        self.event(&mut state, actor, "snapshot", None, Some(snapshot.clone()))?;
+        let result = self.snapshot_locked(&mut state, actor)?;
         self.save(&state)?;
+        Ok(result)
+    }
+    fn snapshot_locked(&self, state: &mut State, actor: &str) -> Result<String> {
+        let snapshot = self.retain(state, false)?;
+        self.event(state, actor, "snapshot", None, Some(snapshot.clone()))?;
         Ok(snapshot)
     }
     pub fn reset(&self, expected: u64, actor: &str) -> Result<String> {
@@ -927,11 +951,15 @@ impl Store {
         let _serial = self.serial()?;
         let mut state = self.load()?;
         self.revision(&state, expected)?;
-        let recovery = self.retain(&mut state, true)?;
+        let result = self.reset_locked(&mut state, actor)?;
+        self.save(&state)?;
+        Ok(result)
+    }
+    fn reset_locked(&self, state: &mut State, actor: &str) -> Result<String> {
+        let recovery = self.retain(state, true)?;
         state.view = View::default();
         state.generation = id();
-        self.event(&mut state, actor, "reset", None, Some(recovery.clone()))?;
-        self.save(&state)?;
+        self.event(state, actor, "reset", None, Some(recovery.clone()))?;
         Ok(recovery)
     }
     pub fn rollback(&self, expected: u64, snapshot_id: &str, actor: &str) -> Result<String> {
@@ -939,6 +967,11 @@ impl Store {
         let _serial = self.serial()?;
         let mut state = self.load()?;
         self.revision(&state, expected)?;
+        let result = self.rollback_locked(&mut state, snapshot_id, actor)?;
+        self.save(&state)?;
+        Ok(result)
+    }
+    fn rollback_locked(&self, state: &mut State, snapshot_id: &str, actor: &str) -> Result<String> {
         let snapshot = state
             .snapshots
             .get(snapshot_id)
@@ -948,17 +981,16 @@ impl Store {
             return Err(Error::Retention);
         }
         self.verify_view(&snapshot.view)?;
-        let recovery = self.retain(&mut state, true)?;
+        let recovery = self.retain(state, true)?;
         state.view = snapshot.view;
         state.generation = id();
         self.event(
-            &mut state,
+            state,
             actor,
             "rollback",
             None,
             Some(snapshot_id.to_string()),
         )?;
-        self.save(&state)?;
         Ok(recovery)
     }
     fn verify_view(&self, view: &View) -> Result<()> {
@@ -982,6 +1014,11 @@ impl Store {
         let _serial = self.serial()?;
         let mut state = self.load()?;
         self.revision(&state, expected)?;
+        self.restore_trash_locked(&mut state, trash_id, actor)?;
+        self.save(&state)?;
+        Ok(())
+    }
+    fn restore_trash_locked(&self, state: &mut State, trash_id: &str, actor: &str) -> Result<()> {
         let trash = state.trash.get(trash_id).cloned().ok_or(Error::NotFound)?;
         if trash.expires_at <= now() {
             return Err(Error::Retention);
@@ -1006,7 +1043,7 @@ impl Store {
                     ..state.clone()
                 };
                 let bytes = self.bytes(&pinned, &trash.path)?;
-                self.publish_file(&mut state, &trash.path, &bytes)?;
+                self.publish_file(state, &trash.path, &bytes)?;
                 state
                     .view
                     .upper
@@ -1017,48 +1054,63 @@ impl Store {
         }
         state.trash.remove(trash_id);
         self.event(
-            &mut state,
+            state,
             actor,
             "restore-trash",
             Some(trash.path),
             Some(trash_id.to_string()),
         )?;
-        self.save(&state)
+        Ok(())
     }
     pub fn purge_trash(&self, expected: u64, trash_id: &str, actor: &str) -> Result<()> {
         let _maintenance = self.maintenance()?;
         let _serial = self.serial()?;
         let mut state = self.load()?;
         self.revision(&state, expected)?;
+        self.purge_trash_locked(&mut state, trash_id, actor)?;
+        self.save(&state)?;
+        Ok(())
+    }
+    fn purge_trash_locked(&self, state: &mut State, trash_id: &str, actor: &str) -> Result<()> {
         let trash = state.trash.remove(trash_id).ok_or(Error::NotFound)?;
         // The whiteout remains: purge must not resurrect the base entry.
         self.event(
-            &mut state,
+            state,
             actor,
             "purge-trash",
             Some(trash.path),
             Some(trash_id.to_string()),
         )?;
-        self.save(&state)
+        Ok(())
     }
     pub fn delete_snapshot(&self, expected: u64, snapshot_id: &str, actor: &str) -> Result<()> {
         let _maintenance = self.maintenance()?;
         let _serial = self.serial()?;
         let mut state = self.load()?;
         self.revision(&state, expected)?;
+        self.delete_snapshot_locked(&mut state, snapshot_id, actor)?;
+        self.save(&state)?;
+        Ok(())
+    }
+    fn delete_snapshot_locked(
+        &self,
+        state: &mut State,
+        snapshot_id: &str,
+        actor: &str,
+    ) -> Result<()> {
         let snapshot = state.snapshots.get(snapshot_id).ok_or(Error::NotFound)?;
         if snapshot.protected_until > now() {
             return Err(Error::Retention);
         }
         state.snapshots.remove(snapshot_id);
         self.event(
-            &mut state,
+            state,
             actor,
             "delete-snapshot",
             None,
             Some(snapshot_id.to_string()),
         )?;
-        self.save(&state)
+        Ok(())
     }
     fn backup_namespace(&self, destination: &BackupDestination) -> Result<PathBuf> {
         if destination.id.is_empty()
@@ -1220,6 +1272,17 @@ impl Store {
         let _serial = self.serial()?;
         let mut state = self.load()?;
         self.revision(&state, expected)?;
+        let result = self.restore_backup_locked(&mut state, destination, backup_id, actor)?;
+        self.save(&state)?;
+        Ok(result)
+    }
+    fn restore_backup_locked(
+        &self,
+        state: &mut State,
+        destination: &BackupDestination,
+        backup_id: &str,
+        actor: &str,
+    ) -> Result<String> {
         let backup = self.backup_manifest(destination, backup_id)?;
         if backup.expires_at <= now() {
             return Err(Error::Retention);
@@ -1256,7 +1319,7 @@ impl Store {
         if actual_size != backup.bytes {
             return Err(Error::Corrupt);
         }
-        let recovery = self.retain(&mut state, true)?;
+        let recovery = self.retain(state, true)?;
         state.view = backup.view;
         state.generation = id();
         state.backups.insert(
@@ -1264,17 +1327,16 @@ impl Store {
             self.backup_manifest(destination, backup_id)?,
         );
         self.event(
-            &mut state,
+            state,
             actor,
             "restore-backup",
             None,
             Some(backup_id.to_string()),
         )?;
-        self.check_budget(&state)?;
+        self.check_budget(state)?;
         for bytes in payload.values() {
             self.put_blob(bytes)?;
         }
-        self.save(&state)?;
         Ok(recovery)
     }
     /// Create, truncate or open under one manifest lock. Checking existence
