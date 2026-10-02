@@ -38,8 +38,8 @@ paths, the configured base path, or another principal's private blobs.
 
 `State` is not extended or otherwise changed by this primitive. The archive
 manifest is a separate, schema-1 representation of the selected revision and
-view; it does not revise the existing durable-state schema, which remains at
-schema `4`.
+view. Durable `State` is now schema `5` for the separate job-backed artifact
+lifecycle; calling this raw primitive does not write that state.
 
 ## Consistency, validation, and writer safety
 
@@ -84,41 +84,55 @@ conditions at admission and immediately before it publishes. A successful
 primitive call is evidence of archive construction, not an authorization token
 or an entitlement to download data.
 
-The management layer is responsible for durable artifact and job records, plan
-binding, idempotency, admission quotas, expiry, publication state, retention,
-and an authorized download API. It must stage privately, publish only after
+The current management candidate implements internal `Action::Export` jobs,
+schema-5 artifact receipts, revision and request binding, idempotency, admission
+quotas, expiry checks and publication state. A product download API remains
+pending. It must stage privately, publish only after
 success, and make later retrieval subject to current authorization. It must not
 treat the archive's deterministic digest as a substitute for any of those
 controls.
 
-The durable artifact policy remains unspecified and pending: artifact TTL,
-artifact count limits, and retained-byte accounting require an explicit
-server-owned policy. Future implementation must define that policy rather than
-silently reuse the snapshot TTL.
+Job-backed capture requires explicit server-owned `Policy.artifacts`. `None`
+disables artifact capture. `ArtifactPolicy` defines its own TTL, count limit and
+byte limit, independently of snapshot TTL. Complete tar bytes count against
+both its byte limit and the store retained-byte budget; registered receipts
+and physical orphans remain charged until physical reclamation. Expiry does
+not free capacity. See [the artifact candidate contract](sambafied-export-artifacts.md)
+for bounds and retry accounting.
+
+`Store::artifact(id, actor)` provides an actor-scoped receipt.
+`Store::open_artifact(id, actor, authorize)` returns a verified, rewound file
+descriptor only after current authorization is checked before archive
+verification and again before return. Ownership alone grants no authorization.
+Automatic expiry pruning and artifact deletion are not implemented.
 
 Public API, CLI download, UI export flow, background runtime behavior, crash
-and fault qualification, and product-level artifact lifecycle remain pending.
+and broader process-kill/end-to-end fault qualification, and product-level
+artifact lifecycle remain pending.
 They require their own contracts and evidence; none are supplied by this
 storage primitive.
 
 ## Evidence and limits
 
-The current source candidate is covered by the focused Windows development
-suite: 55 tests total, comprising 49 existing tests and 6 export tests. The
-export tests demonstrate deterministic output, deduplicated private upper
-content, manifest preservation of whiteouts, exclusion of base and another
-principal's bytes, unchanged storage, pre-write rejection of busy/stale/quota/
-corrupt inputs, private-writer failure without a storage-side publication, and
-partial successful writer calls that still produce a complete verified tar
-stream. The strict core Clippy pass also passes.
+The current source candidate has 62 passing core tests (49 existing plus 13 export
+tests) on Windows and Linux,
+six passing shadow backend tests on Linux, and strict core Clippy passes on
+both platforms. The archive regressions cover deterministic output, private
+upper-content deduplication, whiteouts, isolation, unchanged storage,
+pre-write validation, writer failures, partial writes and pure preflight.
 
-The same 55 tests (6 export and 49 existing) and strict core Clippy pass in a
-bounded Linux source check
-using the pinned Rust 1.98.1 Bookworm container and the project seccomp profile.
+These are source-level candidate checks. They do not establish a CI result for
+these changes, end-to-end acceptance, product API/CLI/UI integration, runtime
+acceptance, deployment or release qualification.
 
-This is source-level candidate evidence only. It does not claim Linux CI
-coverage, a completed CI run, runtime acceptance, an exported artifact service,
-or release qualification.
+PR #10 merged the archive foundation at `955b46b0db53aa000b326853cb52edc7ba2095db`,
+after all four CI checks passed on `3c7ff64`. That merged foundation evidence does not
+qualify the subsequent durable artifact candidate.
+
+The additional durable regressions prove that a completed tar remains charged against
+retained capacity and can block a snapshot; quiescent schema-4-to-5 migration leaves the
+old artifact policy disabled; and a planned running retry rejects a changed TTL before
+publication, then resumes exactly once with the original binding.
 
 ## Pure export preflight
 
@@ -132,6 +146,12 @@ Execution must revalidate; a preflight does not reserve capacity.
 The internal prepared capture separates content validation from archive writing,
 so durable management execution can hold its existing locks, check retained
 capacity and renewed authorization before creating a private staging file.
-The public job/artifact lifecycle and API, CLI and UI integration remain pending.
+The internal durable job/artifact lifecycle is implemented in the current
+source candidate; public API, CLI and UI integration remain pending.
 The sixth export regression verifies exact size agreement, unchanged storage,
 and stale, busy, corrupt and over-budget rejection during preflight.
+
+Source filesystem-fault tests verify private publication before a failed local
+success receipt, restart and retry reconciliation, authorization revocation, and
+changed-TTL rejection. These checks do not establish broader process-kill or
+end-to-end fault qualification.

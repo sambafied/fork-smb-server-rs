@@ -9,6 +9,7 @@ const JOB_LIMIT: usize = 1024;
 #[serde(tag = "action", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum Action {
     Snapshot,
+    Export,
     Reset,
     Rollback {
         snapshot_id: String,
@@ -53,6 +54,8 @@ pub struct JobResult {
     pub recovery_snapshot_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backup_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -137,7 +140,7 @@ impl Action {
             _ => {}
         }
         let source = match self {
-            Self::Snapshot | Self::Reset | Self::Backup { .. } => return Ok(()),
+            Self::Snapshot | Self::Export | Self::Reset | Self::Backup { .. } => return Ok(()),
             Self::Rollback { snapshot_id } | Self::DeleteSnapshot { snapshot_id } => snapshot_id,
             Self::RestoreTrash { trash_id } | Self::PurgeTrash { trash_id } => trash_id,
             Self::RestoreBackup { backup_id, .. } | Self::DeleteBackup { backup_id, .. } => {
@@ -199,6 +202,19 @@ impl Store {
         let fingerprint = self.action_fingerprint(&original, catalog, &action, None)?;
         let mut staged = original.clone();
         match &action {
+            Action::Export => {
+                let capture = self.prepare_artifact(&staged, &id(), actor, now())?;
+                staged
+                    .artifacts
+                    .insert(capture.artifact.id.clone(), capture.artifact.clone());
+                self.event(
+                    &mut staged,
+                    actor,
+                    "export",
+                    None,
+                    Some(capture.artifact.id),
+                )?;
+            }
             Action::Snapshot => {
                 self.snapshot_locked(&mut staged, actor)?;
             }
@@ -274,7 +290,7 @@ impl Store {
             .filter(|path| self.lookup(&original.view, path) != self.lookup(&staged.view, path))
             .count();
         let active_bytes_after = staged.view.upper.values().map(|e| e.size).sum();
-        let retained_bytes_after = staged
+        let retained_bytes_after: u64 = staged
             .snapshots
             .values()
             .flat_map(|s| s.view.upper.values())
@@ -287,6 +303,8 @@ impl Store {
                     .map(|t| t.entry.size),
             )
             .sum();
+        let retained_bytes_after =
+            retained_bytes_after + self.artifact_usage(&staged)?.values().sum::<u64>();
         Ok(ActionImpact {
             revision: original.revision,
             generation: original.generation,
@@ -517,7 +535,7 @@ impl Store {
         let mut external_started = job.status == JobStatus::Running
             && matches!(
                 job.action,
-                Action::Backup { .. } | Action::DeleteBackup { .. }
+                Action::Backup { .. } | Action::DeleteBackup { .. } | Action::Export
             );
         let operation = (|| {
             allowed?;
@@ -543,10 +561,27 @@ impl Store {
                 snapshot_id: None,
                 recovery_snapshot_id: None,
                 backup_id: None,
+                artifact_id: None,
             };
             let mut capture = None;
             let mut deletion = None;
+            let mut export = None;
             match &job.action {
+                Action::Export => {
+                    let capture = self.prepare_artifact(&staged, &job.id, actor, job.created_at)?;
+                    result.artifact_id = Some(capture.artifact.id.clone());
+                    staged
+                        .artifacts
+                        .insert(capture.artifact.id.clone(), capture.artifact.clone());
+                    self.event(
+                        &mut staged,
+                        actor,
+                        "export",
+                        None,
+                        Some(capture.artifact.id.clone()),
+                    )?;
+                    export = Some(capture);
+                }
                 Action::Snapshot => {
                     result.snapshot_id = Some(self.snapshot_locked(&mut staged, actor)?)
                 }
@@ -631,6 +666,10 @@ impl Store {
             }
             self.check_budget(&staged)?;
             authorize(&job)?;
+            if let Some(export) = &export {
+                external_started = true;
+                self.publish_artifact(export)?;
+            }
             if let Some(capture) = &capture {
                 external_started = true;
                 self.publish_capture(capture)?;
