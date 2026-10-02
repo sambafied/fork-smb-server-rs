@@ -56,6 +56,25 @@ pub struct Submission {
     pub replayed: bool,
 }
 
+/// Pure preflight evidence, not authorization or a promise of execution.
+/// The API must bind this to its actor/resource/expiry and recheck on submission.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ActionImpact {
+    pub revision: u64,
+    pub generation: String,
+    pub base_version: String,
+    pub fingerprint: String,
+    pub action: Action,
+    pub affected_entries: usize,
+    pub active_bytes_after: u64,
+    pub retained_bytes_after: u64,
+    pub snapshots_after: usize,
+    pub trash_after: usize,
+    pub recovery_retention_seconds: Option<u64>,
+    pub physical_reclamation_deferred: bool,
+}
+
 impl Action {
     fn validate(&self) -> Result<()> {
         let source = match self {
@@ -71,6 +90,89 @@ impl Action {
 }
 
 impl Store {
+    /// Validate the exact operation against a quiescent, revision-bound state.
+    /// No blob, receipt, history or manifest is written. Busy is a blocker;
+    /// execution must acquire its own gate and validate all preconditions again.
+    pub fn preview_action(
+        &self,
+        expected: u64,
+        actor: &str,
+        action: Action,
+    ) -> Result<ActionImpact> {
+        if actor.is_empty() || actor.len() > 256 {
+            return Err(Error::Path);
+        }
+        action.validate()?;
+        let _maintenance = self.maintenance()?;
+        let _serial = self.serial()?;
+        let original = self.load()?;
+        self.revision(&original, expected)?;
+        let fingerprint = digest(&serde_json::to_vec(&(&original, &self.config.policy))?);
+        let mut staged = original.clone();
+        match &action {
+            Action::Snapshot => {
+                self.snapshot_locked(&mut staged, actor)?;
+            }
+            Action::Reset => {
+                self.reset_locked(&mut staged, actor)?;
+            }
+            Action::Rollback { snapshot_id } => {
+                self.rollback_locked(&mut staged, snapshot_id, actor)?;
+            }
+            Action::RestoreTrash { trash_id } => {
+                self.restore_trash_prepared(&mut staged, trash_id, actor, false)?;
+            }
+            Action::PurgeTrash { trash_id } => {
+                self.purge_trash_locked(&mut staged, trash_id, actor)?;
+            }
+            Action::DeleteSnapshot { snapshot_id } => {
+                self.delete_snapshot_locked(&mut staged, snapshot_id, actor)?;
+            }
+        }
+        self.check_budget(&staged)?;
+        let paths: BTreeSet<_> = self
+            .base
+            .keys()
+            .chain(original.view.upper.keys())
+            .chain(staged.view.upper.keys())
+            .collect();
+        let affected_entries = paths
+            .iter()
+            .filter(|path| self.lookup(&original.view, path) != self.lookup(&staged.view, path))
+            .count();
+        let active_bytes_after = staged.view.upper.values().map(|e| e.size).sum();
+        let retained_bytes_after = staged
+            .snapshots
+            .values()
+            .flat_map(|s| s.view.upper.values())
+            .map(|e| e.size)
+            .chain(
+                staged
+                    .trash
+                    .values()
+                    .filter(|t| t.from_upper)
+                    .map(|t| t.entry.size),
+            )
+            .sum();
+        Ok(ActionImpact {
+            revision: original.revision,
+            generation: original.generation,
+            base_version: original.identity.base_version,
+            fingerprint,
+            recovery_retention_seconds: matches!(action, Action::Reset | Action::Rollback { .. })
+                .then_some(self.config.policy.recovery_protection_seconds),
+            physical_reclamation_deferred: matches!(
+                action,
+                Action::PurgeTrash { .. } | Action::DeleteSnapshot { .. }
+            ),
+            action,
+            affected_entries,
+            active_bytes_after,
+            retained_bytes_after,
+            snapshots_after: staged.snapshots.len(),
+            trash_after: staged.trash.len(),
+        })
+    }
     /// Submit only after API authorization and preview validation. Matching
     /// retries return the same receipt even after its data revision advanced.
     pub fn submit_job(

@@ -44,6 +44,187 @@ impl Lab {
     }
 }
 
+fn stored_files(root: &std::path::Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+    fn visit(
+        root: &std::path::Path,
+        current: &std::path::Path,
+        result: &mut std::collections::BTreeMap<std::path::PathBuf, Vec<u8>>,
+    ) {
+        for entry in fs::read_dir(current).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                visit(root, &path, result);
+            } else {
+                result.insert(
+                    path.strip_prefix(root).unwrap().to_path_buf(),
+                    fs::read(path).unwrap(),
+                );
+            }
+        }
+    }
+    let mut result = std::collections::BTreeMap::new();
+    visit(root, root, &mut result);
+    result
+}
+
+#[test]
+fn action_previews_leave_all_files_unchanged_and_report_reset_recovery() {
+    let lab = Lab::new();
+    let store = lab.open();
+    store.write_file("SAVE.DAT", b"private", "alice").unwrap();
+    let snapshot = store
+        .snapshot(store.inspect().unwrap().revision, "alice")
+        .unwrap();
+    store.write_file("OLD.DAT", b"deleted", "alice").unwrap();
+    let trash = store.delete("OLD.DAT", "alice").unwrap();
+    let state = store.inspect().unwrap();
+    let before = stored_files(store.namespace());
+    for action in [
+        Action::Snapshot,
+        Action::Reset,
+        Action::Rollback {
+            snapshot_id: snapshot.clone(),
+        },
+        Action::RestoreTrash {
+            trash_id: trash.clone(),
+        },
+        Action::PurgeTrash { trash_id: trash },
+        Action::DeleteSnapshot {
+            snapshot_id: snapshot,
+        },
+    ] {
+        let impact = store
+            .preview_action(state.revision, "alice", action.clone())
+            .unwrap();
+        assert_eq!(impact.action, action);
+        assert_eq!(impact.revision, state.revision);
+        assert_eq!(impact.generation, state.generation);
+        if action == Action::Reset {
+            assert_eq!(impact.affected_entries, 1);
+            assert_eq!(impact.active_bytes_after, 0);
+            assert_eq!(impact.recovery_retention_seconds, Some(300));
+        }
+        assert_eq!(stored_files(store.namespace()), before);
+    }
+}
+
+#[test]
+fn base_only_restore_preview_does_not_materialize_a_blob() {
+    let lab = Lab::new();
+    let store = lab.open();
+    let trash = store.delete("SAVE.DAT", "alice").unwrap();
+    let revision = store.inspect().unwrap().revision;
+    let before = stored_files(store.namespace());
+    let action = Action::RestoreTrash { trash_id: trash };
+    let impact = store
+        .preview_action(revision, "alice", action.clone())
+        .unwrap();
+    assert_eq!(impact.active_bytes_after, 8);
+    assert_eq!(impact.affected_entries, 1);
+    assert_eq!(impact.trash_after, 0);
+    assert_eq!(stored_files(store.namespace()), before);
+    assert!(matches!(store.read("SAVE.DAT"), Err(Error::NotFound)));
+    let job = store
+        .submit_job(revision, "alice", "restore", action)
+        .unwrap()
+        .job;
+    assert_eq!(
+        store
+            .execute_job(&job.id, "alice", |_| Ok(()))
+            .unwrap()
+            .status,
+        JobStatus::Succeeded
+    );
+    assert_eq!(store.read("SAVE.DAT").unwrap(), b"original");
+}
+
+#[test]
+fn preview_rechecks_busy_revision_conflict_and_protected_source_without_writes() {
+    let lab = Lab::new();
+    let store = lab.open();
+    let state = store.inspect().unwrap();
+    let lease = store.lease().unwrap();
+    assert!(matches!(
+        store.preview_action(state.revision, "alice", Action::Reset),
+        Err(Error::Busy)
+    ));
+    drop(lease);
+    store.write_file("SAVE.DAT", b"new", "alice").unwrap();
+    assert!(matches!(
+        store.preview_action(state.revision, "alice", Action::Reset),
+        Err(Error::Revision)
+    ));
+    let recovery = store
+        .reset(store.inspect().unwrap().revision, "alice")
+        .unwrap();
+    let before = stored_files(store.namespace());
+    assert!(matches!(
+        store.preview_action(
+            store.inspect().unwrap().revision,
+            "alice",
+            Action::DeleteSnapshot {
+                snapshot_id: recovery
+            }
+        ),
+        Err(Error::Retention)
+    ));
+    assert_eq!(stored_files(store.namespace()), before);
+    store.write_file("OLD.DAT", b"old", "alice").unwrap();
+    let trash = store.delete("OLD.DAT", "alice").unwrap();
+    store
+        .write_file("OLD.DAT", b"replacement", "alice")
+        .unwrap();
+    let before = stored_files(store.namespace());
+    assert!(matches!(
+        store.preview_action(
+            store.inspect().unwrap().revision,
+            "alice",
+            Action::RestoreTrash { trash_id: trash }
+        ),
+        Err(Error::Exists)
+    ));
+    assert_eq!(stored_files(store.namespace()), before);
+}
+
+#[test]
+fn preview_fingerprint_binds_source_and_policy_and_recovery_quota_is_checked() {
+    let mut policy_lab = Lab::new();
+    let policy_store = policy_lab.open();
+    let policy_before = policy_store
+        .preview_action(0, "alice", Action::Snapshot)
+        .unwrap();
+    drop(policy_store);
+    policy_lab.config.policy.retained_bytes -= 1;
+    let policy_store = policy_lab.open();
+    let policy_after = policy_store
+        .preview_action(0, "alice", Action::Snapshot)
+        .unwrap();
+    assert_ne!(policy_before.fingerprint, policy_after.fingerprint);
+    assert_eq!(policy_before.revision, policy_after.revision);
+    assert_eq!(policy_before.generation, policy_after.generation);
+    let mut lab = Lab::new();
+    let store = lab.open();
+    let original = store.preview_action(0, "alice", Action::Snapshot).unwrap();
+    assert_eq!(
+        original,
+        store.preview_action(0, "alice", Action::Snapshot).unwrap()
+    );
+    store.write_file("SAVE.DAT", b"private", "alice").unwrap();
+    let current = store
+        .preview_action(store.inspect().unwrap().revision, "alice", Action::Snapshot)
+        .unwrap();
+    assert_ne!(original.fingerprint, current.fingerprint);
+    drop(store);
+    lab.config.policy.retained_bytes = 4;
+    let store = lab.open();
+    let before = stored_files(store.namespace());
+    assert!(matches!(
+        store.preview_action(store.inspect().unwrap().revision, "alice", Action::Reset),
+        Err(Error::Quota)
+    ));
+    assert_eq!(stored_files(store.namespace()), before);
+}
+
 #[test]
 fn reset_receipt_data_history_and_recovery_commit_together_and_retry_once() {
     let lab = Lab::new();
