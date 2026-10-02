@@ -1,0 +1,31 @@
+name: Sambafied CI
+
+on:
+  push:
+    branches:
+      - "sambafied/**"
+  pull_request:
+    branches:
+      - "sambafied/**"
+
+permissions:
+  contents: read
+
+jobs:
+  check-and-unit-tests:
+    name: Locked check and portable unit tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Install Rust 1.98.1
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+
+      - name: Check server package with the lockfile
+        run: cargo check --locked -p smb-server
+
+      - name: Run portable unit suites
+        run: cargo test --locked -p smb-server-auth -p smb-server-proto -p smb-server-vfs
