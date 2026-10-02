@@ -323,7 +323,7 @@ fn schema_two_jobs_migrate_unchanged_and_invalid_bindings_fail_closed() {
     assert!(matches!(Store::open(lab.config.clone()), Err(Error::Busy)));
     drop(lease);
     let migrated = lab.open();
-    assert_eq!(migrated.inspect().unwrap().schema, 3);
+    assert_eq!(migrated.inspect().unwrap().schema, 4);
     assert_eq!(migrated.job(&job.id, "alice").unwrap(), job);
     state["jobs"][&job.id]["request_binding"] = serde_json::json!({
         "plan_id": uuid::Uuid::new_v4().to_string(),
@@ -342,7 +342,7 @@ fn schema_two_jobs_migrate_unchanged_and_invalid_bindings_fail_closed() {
         Store::open(lab.config.clone()),
         Err(Error::Corrupt)
     ));
-    state["schema"] = 4.into();
+    state["schema"] = 5.into();
     fs::write(&path, serde_json::to_vec(&state).unwrap()).unwrap();
     assert!(matches!(
         Store::open(lab.config.clone()),
@@ -720,7 +720,7 @@ fn migration_requires_quiescence_and_unknown_schema_fields_fail_closed() {
         1
     );
     drop(lease);
-    assert_eq!(lab.open().inspect().unwrap().schema, 3);
+    assert_eq!(lab.open().inspect().unwrap().schema, 4);
     let mut future = serde_json::to_value(store.inspect().unwrap()).unwrap();
     future["future_management_records"] = serde_json::json!([]);
     fs::write(&path, serde_json::to_vec(&future).unwrap()).unwrap();
