@@ -305,6 +305,62 @@ fn artifact_lab() -> (tempfile::TempDir, Config) {
 }
 
 #[test]
+fn export_accepts_smb_copy_up_identity_after_rename_and_reopen() {
+    let (_temp, config) = artifact_lab();
+    let store = Store::open(config.clone()).unwrap();
+    let handle = store.open_handle("MASTER.DAT", true).unwrap();
+    let base_id = handle.object_id.clone();
+    assert!(uuid::Uuid::parse_str(&base_id).is_err());
+    store.write_handle(&handle, 0, b"private", "alice").unwrap();
+    store
+        .rename("MASTER.DAT", "RENAMED.DAT", false, "alice")
+        .unwrap();
+    drop(handle);
+    drop(store);
+    let store = Store::open(config.clone()).unwrap();
+    let state = store.inspect().unwrap();
+    assert_eq!(state.view.upper["renamed.dat"].object_id, base_id);
+    let private_bytes = store.read("RENAMED.DAT").unwrap();
+    let preflight = store.export_preflight(state.revision).unwrap();
+    let mut raw = vec![];
+    store.export_archive(state.revision, &mut raw).unwrap();
+    assert_eq!(preflight.bytes, raw.len() as u64);
+    let preview = store
+        .preview_action(state.revision, "alice", Action::Export)
+        .unwrap();
+    let job = store
+        .submit_planned_job(
+            state.revision,
+            "alice",
+            "copy-up-export",
+            Action::Export,
+            RequestBinding {
+                plan_id: uuid::Uuid::new_v4().to_string(),
+                source_fingerprint: preview.fingerprint,
+            },
+        )
+        .unwrap()
+        .job;
+    assert_eq!(
+        store
+            .execute_job(&job.id, "alice", |_| Ok(()))
+            .unwrap()
+            .status,
+        JobStatus::Succeeded
+    );
+    let (_, mut file) = store.open_artifact(&job.id, "alice", |_| Ok(())).unwrap();
+    let mut published = vec![];
+    file.read_to_end(&mut published).unwrap();
+    assert_eq!(published, raw);
+    assert_eq!(store.inspect().unwrap().view, state.view);
+    assert_eq!(store.read("RENAMED.DAT").unwrap(), private_bytes);
+    assert_eq!(
+        fs::read(config.base.join("MASTER.DAT")).unwrap(),
+        b"shared-base-must-not-be-exported"
+    );
+}
+
+#[test]
 fn durable_export_job_and_verified_download_survive_reopen_without_changing_view() {
     let (temp, config) = artifact_lab();
     let store = Store::open(config.clone()).unwrap();
