@@ -91,6 +91,11 @@ success, and make later retrieval subject to current authorization. It must not
 treat the archive's deterministic digest as a substitute for any of those
 controls.
 
+The durable artifact policy remains unspecified and pending: artifact TTL,
+artifact count limits, and retained-byte accounting require an explicit
+server-owned policy. Future implementation must define that policy rather than
+silently reuse the snapshot TTL.
+
 Public API, CLI download, UI export flow, background runtime behavior, crash
 and fault qualification, and product-level artifact lifecycle remain pending.
 They require their own contracts and evidence; none are supplied by this
@@ -107,7 +112,8 @@ corrupt inputs, private-writer failure without a storage-side publication, and
 partial successful writer calls that still produce a complete verified tar
 stream. The strict core Clippy pass also passes.
 
-The same 54 tests and strict core Clippy pass in a bounded Linux source check
+The same 55 tests (6 export and 49 existing) and strict core Clippy pass in a
+bounded Linux source check
 using the pinned Rust 1.98.1 Bookworm container and the project seccomp profile.
 
 This is source-level candidate evidence only. It does not claim Linux CI
