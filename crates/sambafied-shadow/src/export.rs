@@ -22,6 +22,22 @@ pub struct ExportSummary {
     pub revision: u64,
 }
 
+/// Pure archive preflight. This is not a job receipt or download artifact.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExportPreflight {
+    pub bytes: u64,
+    pub generation: String,
+    pub revision: u64,
+}
+
+pub(crate) struct PreparedExport {
+    manifest: ExportManifest,
+    manifest_bytes: Vec<u8>,
+    blobs: BTreeMap<String, u64>,
+    pub(crate) preflight: ExportPreflight,
+}
+
 struct ArchiveWriter<W> {
     inner: W,
     hash: Sha256,
@@ -71,6 +87,23 @@ impl Store {
         let _serial = self.serial()?;
         let state = self.load()?;
         self.revision(&state, expected)?;
+        let prepared = self.prepare_export(&state)?;
+        self.write_export(&prepared, writer)
+    }
+
+    /// Validate all upper content and compute exact tar bytes without creating
+    /// an archive, job, history entry, or changing overlay state.
+    pub fn export_preflight(&self, expected: u64) -> Result<ExportPreflight> {
+        let _maintenance = self.maintenance()?;
+        let _serial = self.serial()?;
+        let state = self.load()?;
+        self.revision(&state, expected)?;
+        Ok(self.prepare_export(&state)?.preflight)
+    }
+
+    // Management execution already owns both locks. Keeping preparation and
+    // writing separate lets it check quota and authorization before staging.
+    pub(crate) fn prepare_export(&self, state: &State) -> Result<PreparedExport> {
         for (path, entry) in &state.view.upper {
             if path.is_empty()
                 || normalize(path).map_err(|_| Error::Corrupt)? != *path
@@ -91,11 +124,11 @@ impl Store {
         }
         let manifest = ExportManifest {
             schema: 1,
-            identity: state.identity,
-            base_digest: state.base_digest,
+            identity: state.identity.clone(),
+            base_digest: state.base_digest.clone(),
             generation: state.generation.clone(),
             revision: state.revision,
-            view: state.view,
+            view: state.view.clone(),
         };
         let manifest_bytes = serde_json::to_vec(&manifest)?;
         let mut blobs = BTreeMap::new();
@@ -130,6 +163,25 @@ impl Store {
                 return Err(Error::Corrupt);
             }
         }
+        let preflight = ExportPreflight {
+            bytes: expected_bytes,
+            generation: manifest.generation.clone(),
+            revision: manifest.revision,
+        };
+        Ok(PreparedExport {
+            manifest,
+            manifest_bytes,
+            blobs,
+            preflight,
+        })
+    }
+
+    pub(crate) fn write_export<W: Write>(
+        &self,
+        prepared: &PreparedExport,
+        writer: W,
+    ) -> Result<ExportSummary> {
+        let expected_bytes = prepared.preflight.bytes;
         let writer = ArchiveWriter {
             inner: writer,
             hash: Sha256::new(),
@@ -138,8 +190,8 @@ impl Store {
         };
         let mut archive = tar::Builder::new(writer);
         archive.follow_symlinks(false);
-        append(&mut archive, "manifest.json", &manifest_bytes)?;
-        for (hash, size) in &blobs {
+        append(&mut archive, "manifest.json", &prepared.manifest_bytes)?;
+        for (hash, size) in &prepared.blobs {
             let bytes = bounded_read(&self.blob_path(hash)?, self.config.policy.max_file_bytes)?;
             if bytes.len() as u64 != *size || digest(&bytes) != *hash {
                 return Err(Error::Corrupt);
@@ -154,8 +206,8 @@ impl Store {
         Ok(ExportSummary {
             bytes: writer.bytes,
             sha256: format!("{:x}", writer.hash.finalize()),
-            generation: manifest.generation,
-            revision: manifest.revision,
+            generation: prepared.manifest.generation.clone(),
+            revision: prepared.manifest.revision,
         })
     }
 }

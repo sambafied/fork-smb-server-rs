@@ -99,7 +99,7 @@ storage primitive.
 ## Evidence and limits
 
 The current source candidate is covered by the focused Windows development
-suite: 54 tests total, comprising 49 existing tests and 5 export tests. The
+suite: 55 tests total, comprising 49 existing tests and 6 export tests. The
 export tests demonstrate deterministic output, deduplicated private upper
 content, manifest preservation of whiteouts, exclusion of base and another
 principal's bytes, unchanged storage, pre-write rejection of busy/stale/quota/
@@ -113,3 +113,19 @@ using the pinned Rust 1.98.1 Bookworm container and the project seccomp profile.
 This is source-level candidate evidence only. It does not claim Linux CI
 coverage, a completed CI run, runtime acceptance, an exported artifact service,
 or release qualification.
+
+## Pure export preflight
+
+`Store::export_preflight(expected_revision)` validates the same logical metadata,
+blob hashes, file sizes, quiescence, revision and staging budget as archive
+capture. It returns exact uncompressed tar bytes, generation and revision without
+writing an archive or changing storage. The result is preparation evidence, not
+an artifact ID, authorization decision, durable receipt or confirmation plan.
+Execution must revalidate; a preflight does not reserve capacity.
+
+The internal prepared capture separates content validation from archive writing,
+so durable management execution can hold its existing locks, check retained
+capacity and renewed authorization before creating a private staging file.
+The public job/artifact lifecycle and API, CLI and UI integration remain pending.
+The sixth export regression verifies exact size agreement, unchanged storage,
+and stale, busy, corrupt and over-budget rejection during preflight.

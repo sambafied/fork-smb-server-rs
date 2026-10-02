@@ -247,3 +247,45 @@ fn partial_successful_writes_produce_the_complete_verified_tar_stream() {
         2
     );
 }
+
+#[test]
+fn pure_preflight_matches_archive_size_and_revalidates_stale_or_corrupt_content() {
+    let (temp, config) = lab();
+    let store = Store::open(config.clone()).unwrap();
+    store.write_file("SAVE.DAT", b"save-data", "alice").unwrap();
+    let revision = store.inspect().unwrap().revision;
+    let before = tree(temp.path());
+    let preflight = store.export_preflight(revision).unwrap();
+    assert_eq!(before, tree(temp.path()));
+    let mut bytes = vec![];
+    let summary = store.export_archive(revision, &mut bytes).unwrap();
+    assert_eq!(preflight.bytes, summary.bytes);
+    assert_eq!(preflight.generation, summary.generation);
+    assert_eq!(preflight.revision, summary.revision);
+    assert_eq!(before, tree(temp.path()));
+    assert!(matches!(
+        store.export_preflight(revision + 1),
+        Err(Error::Revision)
+    ));
+    let lease = store.lease().unwrap();
+    assert!(matches!(store.export_preflight(revision), Err(Error::Busy)));
+    drop(lease);
+    let mut limited = config;
+    limited.policy.temporary_bytes = 1024;
+    assert!(matches!(
+        Store::open(limited).unwrap().export_preflight(revision),
+        Err(Error::Quota)
+    ));
+    let blob = before
+        .keys()
+        .find(|path| {
+            path.parent()
+                .is_some_and(|parent| parent.ends_with("blobs"))
+        })
+        .unwrap();
+    fs::write(blob, b"tampered").unwrap();
+    assert!(matches!(
+        store.export_preflight(revision),
+        Err(Error::Corrupt)
+    ));
+}
