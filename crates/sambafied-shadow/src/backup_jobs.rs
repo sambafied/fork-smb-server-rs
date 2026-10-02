@@ -72,15 +72,19 @@ impl Store {
             }
             _ => None,
         };
-        if catalog.is_empty() && external.is_none() {
-            Ok(digest(&serde_json::to_vec(&(state, &self.config.policy))?))
+        let fingerprint = if catalog.is_empty() && external.is_none() {
+            digest(&serde_json::to_vec(&(state, &self.config.policy))?)
         } else {
-            Ok(digest(&serde_json::to_vec(&(
+            digest(&serde_json::to_vec(&(
                 state,
                 &self.config.policy,
                 catalog,
                 external,
-            ))?))
+            ))?)
+        };
+        match self.policy_revision {
+            None => Ok(fingerprint),
+            Some(revision) => Ok(digest(&serde_json::to_vec(&(fingerprint, revision))?)),
         }
     }
 

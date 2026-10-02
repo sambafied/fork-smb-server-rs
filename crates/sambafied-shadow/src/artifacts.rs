@@ -257,7 +257,8 @@ impl Store {
     pub fn artifact(&self, artifact_id: &str, actor: &str) -> Result<ExportArtifact> {
         canonical_id(artifact_id)?;
         let _serial = self.serial()?;
-        let state = self.load()?;
+        let current = &_serial.store;
+        let state = current.load()?;
         let artifact = state
             .artifacts
             .get(artifact_id)
@@ -281,7 +282,8 @@ impl Store {
     {
         canonical_id(artifact_id)?;
         let _serial = self.serial()?;
-        let state = self.load()?;
+        let current = &_serial.store;
+        let state = current.load()?;
         let artifact = state
             .artifacts
             .get(artifact_id)
@@ -291,7 +293,7 @@ impl Store {
             return Err(Error::Retention);
         }
         authorize(artifact)?;
-        let file = self.verify_artifact_file(artifact)?;
+        let file = current.verify_artifact_file(artifact)?;
         if artifact.expires_at <= now() {
             return Err(Error::Retention);
         }

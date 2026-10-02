@@ -1,5 +1,5 @@
 //! Behavioral tests for private protocol storage, cleanup and reservations.
-use sambafied_shadow::{Config, Identity, Policy, Store};
+use sambafied_shadow::{Config, Identity, Policy, SharePolicyCatalog, Store};
 use smb_server_backend_shadow::{ShadowVfs, UnmappedVfs};
 use smb_server_vfs::{CreateArgs, SetOp, Vfs, VfsError};
 use std::{
@@ -377,4 +377,54 @@ async fn metadata_only_root_opens_and_unsupported_operations_are_explicit() {
         Err(VfsError::AccessDenied)
     ));
     assert!(matches!(denied.list("").await, Err(VfsError::AccessDenied)));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn open_protocol_handles_observe_policy_edits_and_disk_limits() {
+    let lab = Lab::new();
+    let root = lab._temp.path().join("policies");
+    fs::create_dir(&root).unwrap();
+    let catalog =
+        SharePolicyCatalog::open(&root, "org", "games", lab.config.policy.clone()).unwrap();
+    let alice = ShadowVfs::new_with_policy_catalog(lab.config.clone(), catalog.clone()).unwrap();
+    let mut bob_config = lab.config.clone();
+    bob_config.identity.principal = "bob".into();
+    let bob = ShadowVfs::new_with_policy_catalog(bob_config, catalog.clone()).unwrap();
+    let (mut writer, _, _) = alice
+        .create("SAVE.DAT", false, READ | WRITE, 3, 0x40, 0x80)
+        .await
+        .unwrap();
+    alice
+        .write(&mut writer, 0, b"old save", true)
+        .await
+        .unwrap();
+    assert_eq!(alice.query_disk().await.unwrap().0, 1);
+    let mut reduced = lab.config.policy.clone();
+    reduced.active_bytes = 1;
+    reduced.max_file_bytes = 1;
+    catalog.replace(0, "admin", reduced).unwrap();
+    assert_eq!(alice.read(&mut writer, 0, 128).await.unwrap(), b"old save");
+    assert!(matches!(
+        alice.write(&mut writer, 0, b"new save", true).await,
+        Err(VfsError::AccessDenied)
+    ));
+    assert_eq!(alice.query_disk().await.unwrap().1, 0);
+    assert!(matches!(
+        bob.create("SAVE.DAT", false, READ, 1, 0x40, 0x80).await,
+        Err(VfsError::NotFound)
+    ));
+    let (mut base, _, _) = bob
+        .create("BASE.TXT", false, READ, 1, 0x40, 0x80)
+        .await
+        .unwrap();
+    assert_eq!(
+        bob.read(&mut base, 0, 128).await.unwrap(),
+        b"immutable base"
+    );
+    assert_eq!(
+        fs::read(lab.config.base.join("BASE.TXT")).unwrap(),
+        b"immutable base"
+    );
+    alice.close(writer).await.unwrap();
+    bob.close(base).await.unwrap();
 }

@@ -1,4 +1,6 @@
-use sambafied_shadow::{Error, Policy, SharePolicyCatalog};
+use sambafied_shadow::{
+    Action, Config, Error, Identity, Policy, RequestBinding, SharePolicyCatalog, Store,
+};
 use std::fs;
 
 fn policy() -> Policy {
@@ -213,4 +215,184 @@ fn policy_reader_child() {
     println!("POLICY_LEASE_READY");
     std::io::stdout().flush().unwrap();
     std::io::stdin().read_exact(&mut [0]).unwrap();
+}
+
+fn store_config(root: &std::path::Path, principal: &str) -> Config {
+    let base = root.join("base");
+    let upper = root.join(principal);
+    fs::create_dir_all(&base).unwrap();
+    fs::create_dir_all(&upper).unwrap();
+    if !base.join("SAVE.DAT").exists() {
+        fs::write(base.join("SAVE.DAT"), b"base-save").unwrap();
+    }
+    Config {
+        root: upper,
+        base,
+        identity: Identity {
+            organization: "org".into(),
+            share: "games".into(),
+            principal: principal.into(),
+            base_version: "v1".into(),
+        },
+        policy: policy(),
+    }
+}
+
+#[test]
+fn already_open_store_and_handle_enforce_new_limits_without_hiding_old_data() {
+    let temp = tempfile::tempdir().unwrap();
+    let catalog = SharePolicyCatalog::open(temp.path(), "org", "games", policy()).unwrap();
+    let config = store_config(temp.path(), "alice");
+    let alice = Store::open_with_policy_catalog(config.clone(), catalog.clone()).unwrap();
+    let bob =
+        Store::open_with_policy_catalog(store_config(temp.path(), "bob"), catalog.clone()).unwrap();
+    alice.write_file("SAVE.DAT", b"alice-old", "alice").unwrap();
+    bob.write_file("SAVE.DAT", b"bob", "bob").unwrap();
+    let initial = alice.inspect().unwrap();
+    let snapshot_id = alice.snapshot(initial.revision, "alice").unwrap();
+    let alice_before = serde_json::to_vec(&alice.inspect().unwrap()).unwrap();
+    let bob_before = serde_json::to_vec(&bob.inspect().unwrap()).unwrap();
+    let handle = alice.open_handle("SAVE.DAT", true).unwrap();
+    let mut lower = policy();
+    lower.max_file_bytes = 4;
+    lower.active_bytes = 4;
+    lower.snapshot_ttl_seconds = 600;
+    catalog.replace(0, "operator", lower).unwrap();
+    let (state, effective, revision) = alice.inspect_with_policy().unwrap();
+    assert_eq!(effective.max_file_bytes, 4);
+    assert_eq!(revision, Some(1));
+    assert_eq!(serde_json::to_vec(&state).unwrap(), alice_before);
+    assert!(state.snapshots.contains_key(&snapshot_id));
+    assert_eq!(alice.read("SAVE.DAT").unwrap(), b"alice-old");
+    assert_eq!(alice.read_handle(&handle, 0, 100).unwrap(), b"alice-old");
+    assert!(matches!(
+        alice.write_handle(&handle, 0, b"denied", "alice"),
+        Err(Error::Quota)
+    ));
+    assert!(matches!(
+        alice.resize_handle(&handle, 5, "alice"),
+        Err(Error::Quota)
+    ));
+    assert_eq!(
+        serde_json::to_vec(&alice.inspect().unwrap()).unwrap(),
+        alice_before
+    );
+    assert_eq!(
+        serde_json::to_vec(&bob.inspect().unwrap()).unwrap(),
+        bob_before
+    );
+    assert_eq!(
+        fs::read(config.base.join("SAVE.DAT")).unwrap(),
+        b"base-save"
+    );
+    drop(handle);
+    let reopened = Store::open_with_policy_catalog(config, catalog).unwrap();
+    assert_eq!(reopened.inspect_with_policy().unwrap().1.max_file_bytes, 4);
+    assert_eq!(reopened.read("SAVE.DAT").unwrap(), b"alice-old");
+}
+
+#[test]
+fn policy_aba_invalidates_preview_and_queued_action_without_generation_change() {
+    let temp = tempfile::tempdir().unwrap();
+    let catalog = SharePolicyCatalog::open(temp.path(), "org", "games", policy()).unwrap();
+    let store =
+        Store::open_with_policy_catalog(store_config(temp.path(), "alice"), catalog.clone())
+            .unwrap();
+    store.write_file("SAVE.DAT", b"private", "alice").unwrap();
+    let state = store.inspect().unwrap();
+    let impact = store
+        .preview_planned_action(state.revision, "alice", Action::Snapshot)
+        .unwrap();
+    let binding = RequestBinding {
+        plan_id: uuid::Uuid::new_v4().to_string(),
+        source_fingerprint: impact.fingerprint,
+    };
+    let queued = store
+        .submit_planned_job(
+            state.revision,
+            "alice",
+            "queued-before-policy",
+            Action::Snapshot,
+            binding.clone(),
+        )
+        .unwrap();
+    let mut changed = policy();
+    changed.active_bytes = 2048;
+    catalog.replace(0, "operator", changed).unwrap();
+    catalog.replace(1, "operator", policy()).unwrap();
+    assert!(matches!(
+        store.submit_planned_job(
+            state.revision,
+            "alice",
+            "stale-plan",
+            Action::Snapshot,
+            binding
+        ),
+        Err(Error::Revision)
+    ));
+    let completed = store
+        .execute_job(&queued.job.id, "alice", |_| Ok(()))
+        .unwrap();
+    assert_eq!(completed.status, sambafied_shadow::JobStatus::Failed);
+    let after = store.inspect().unwrap();
+    assert_eq!(after.generation, state.generation);
+    assert_eq!(after.revision, state.revision);
+    assert!(after.snapshots.is_empty());
+    assert_eq!(store.read("SAVE.DAT").unwrap(), b"private");
+}
+
+#[test]
+fn mismatched_policy_authority_is_rejected_before_upper_namespace_creation() {
+    let temp = tempfile::tempdir().unwrap();
+    let catalog = SharePolicyCatalog::open(temp.path(), "other-org", "games", policy()).unwrap();
+    let config = store_config(temp.path(), "alice");
+    assert!(matches!(
+        Store::open_with_policy_catalog(config.clone(), catalog),
+        Err(Error::Corrupt)
+    ));
+    assert_eq!(fs::read_dir(config.root).unwrap().count(), 0);
+}
+
+#[test]
+fn export_holds_one_policy_until_the_last_archive_write() {
+    use std::io::Write;
+    struct Probe {
+        catalog: SharePolicyCatalog,
+        attempts: usize,
+        bytes: Vec<u8>,
+    }
+    impl Write for Probe {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            assert!(matches!(
+                self.catalog.replace(0, "operator", policy()),
+                Err(Error::Busy)
+            ));
+            self.attempts += 1;
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let mut initial = policy();
+    initial.temporary_bytes = 8192;
+    let catalog = SharePolicyCatalog::open(temp.path(), "org", "games", initial).unwrap();
+    let store =
+        Store::open_with_policy_catalog(store_config(temp.path(), "alice"), catalog.clone())
+            .unwrap();
+    store.write_file("SAVE.DAT", b"private", "alice").unwrap();
+    let state = store.inspect().unwrap();
+    let mut probe = Probe {
+        catalog: catalog.clone(),
+        attempts: 0,
+        bytes: Vec::new(),
+    };
+    let summary = store.export_archive(state.revision, &mut probe).unwrap();
+    assert!(probe.attempts > 1);
+    assert_eq!(probe.bytes.len() as u64, summary.bytes);
+    assert_eq!(catalog.read().unwrap().document().revision, 0);
+    catalog.replace(0, "operator", policy()).unwrap();
+    assert_eq!(store.inspect().unwrap().revision, state.revision);
 }

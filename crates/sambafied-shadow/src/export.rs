@@ -85,10 +85,11 @@ impl Store {
     pub fn export_archive<W: Write>(&self, expected: u64, writer: W) -> Result<ExportSummary> {
         let _maintenance = self.maintenance()?;
         let _serial = self.serial()?;
-        let state = self.load()?;
-        self.revision(&state, expected)?;
-        let prepared = self.prepare_export(&state)?;
-        self.write_export(&prepared, writer)
+        let current = &_serial.store;
+        let state = current.load()?;
+        current.revision(&state, expected)?;
+        let prepared = current.prepare_export(&state)?;
+        current.write_export(&prepared, writer)
     }
 
     /// Validate all upper content and compute exact tar bytes without creating
@@ -96,9 +97,10 @@ impl Store {
     pub fn export_preflight(&self, expected: u64) -> Result<ExportPreflight> {
         let _maintenance = self.maintenance()?;
         let _serial = self.serial()?;
-        let state = self.load()?;
-        self.revision(&state, expected)?;
-        Ok(self.prepare_export(&state)?.preflight)
+        let current = &_serial.store;
+        let state = current.load()?;
+        current.revision(&state, expected)?;
+        Ok(current.prepare_export(&state)?.preflight)
     }
 
     // Management execution already owns both locks. Keeping preparation and
