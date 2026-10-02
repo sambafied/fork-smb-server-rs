@@ -435,17 +435,16 @@ pub(crate) async fn process_frame(
     conn.seal_current = false;
     conn.req_encrypted = request_encrypted;
 
-    let mut parts: Vec<(Vec<u8>, bool)> = Vec::new(); // (resp, may_wrap)
+    let mut parts: Vec<(Vec<u8>, bool, AsyncCrypto)> = Vec::new();
     let mut related_flags: Vec<bool> = Vec::new(); // request carried FLAGS_RELATED_OPERATIONS
     // Work on an owned copy so a related follow-up request's wildcard FileId
     // can be patched in place with the chain's last-created handle.
     let mut work: Vec<u8> = buf.to_vec();
     conn.chain_fid = None;
-    let mut off = 0usize;
-    loop {
-        if off + hdr::LEN > work.len() {
-            break;
-        }
+    // Validate the whole chain before any command can change storage. Each
+    // signature covers its original command and padding, not later commands.
+    for range in compound_ranges(buf)? {
+        let off = range.start;
         // A related request ([MS-SMB2] §3.3.5.2.7.2) that carries the wildcard
         // FileId {0xFF..} refers to the FileId produced by the previous CREATE
         // in this chain — substitute it before the handler parses the body.
@@ -455,16 +454,16 @@ pub(crate) async fn process_frame(
                 let cmd = g16(&work, off + hdr::COMMAND);
                 if let Some(foff) = file_id_body_offset(cmd) {
                     let abs = off + hdr::LEN + foff;
-                    if abs + c::FileId::LEN <= work.len()
+                    if abs + c::FileId::LEN <= range.end
                         && work[abs..abs + c::FileId::LEN] == c::FileId::WILDCARD
                     {
                         work[abs..abs + c::FileId::LEN].copy_from_slice(&fid);
                     }
                 }
             }
-        let rest = &work[off..];
+        let rest = &work[range.clone()];
         #[cfg_attr(not(feature = "lib"), allow(unused_variables))]
-        let (single, may_wrap) = process_single(server, conn, rest).await?;
+        let (single, may_wrap) = process_single(server, conn, rest, &buf[range]).await?;
         // Refund the Credits this response grants back to the client's
         // balance ([MS-SMB2] §3.3.1.1) — the field was stamped by
         // response() as max(CreditCharge, 1).
@@ -472,14 +471,8 @@ pub(crate) async fn process_frame(
         conn.client_credits = conn.client_credits.saturating_add(granted);
         #[cfg(not(feature = "lib"))]
         let may_wrap = false; // sealing unsupported on this backend
-        parts.push((single, may_wrap));
+        parts.push((single, may_wrap, AsyncCrypto::snapshot(conn, false)));
         related_flags.push(flags & hdr_flags::RELATED_OPERATIONS != 0);
-
-        let next = g32(&work, off + hdr::NEXT_COMMAND) as usize;
-        if next == 0 || next >= work.len() - off {
-            break;
-        }
-        off += next;
     }
     if parts.is_empty() {
         return None;
@@ -490,7 +483,7 @@ pub(crate) async fn process_frame(
     let mut out: Vec<u8> =
         Vec::with_capacity(parts.iter().map(|p| p.0.len() + (hdr::ALIGN - 1)).sum());
     let mut starts = Vec::with_capacity(parts.len());
-    for (p, _) in &parts {
+    for (p, _, _) in &parts {
         while !out.len().is_multiple_of(hdr::ALIGN) {
             out.push(0);
         }
@@ -512,6 +505,18 @@ pub(crate) async fn process_frame(
         }
     }
 
+    // NextCommand, related flags and alignment padding are covered by the
+    // signature. Seal each signed response only after its final wire layout.
+    for (index, start) in starts.iter().copied().enumerate() {
+        let end = starts.get(index + 1).copied().unwrap_or(out.len());
+        let crypto = &parts[index].2;
+        if g32(&out, start + hdr::FLAGS) & hdr_flags::SIGNED != 0
+            && let Some(key) = crypto.signing_key
+        {
+            sign_pdu(&mut out[start..end], &key, crypto.dialect, crypto.signing_algo);
+        }
+    }
+
     // Seal the whole reply when the session requires encryption, or when the
     // request itself arrived encrypted ([MS-SMB2] §3.3.5.16 — a sealed request
     // is answered with a sealed response even if the server does not force it).
@@ -527,7 +532,7 @@ pub(crate) async fn process_frame(
             .and_then(|n| server.shares.get(&n))
             .is_some_and(|s| s.encrypt);
     if (conn.encrypt_data || request_encrypted || tree_requires_seal)
-        && parts.iter().all(|(_, w)| *w)
+        && parts.iter().all(|(_, w, _)| *w)
     {
         // The AEAD transform provides integrity, so each inner PDU travels
         // unsigned with a zero Signature field ([MS-SMB2] §3.3.4.1.1).
@@ -553,6 +558,29 @@ pub(crate) async fn process_frame(
         return Some(sealed);
     }
     Some(out)
+}
+
+/// Bound each compound command to its signed wire span, including padding.
+fn compound_ranges(buf: &[u8]) -> Option<Vec<std::ops::Range<usize>>> {
+    let mut ranges = Vec::new();
+    let mut start = 0usize;
+    loop {
+        let header = smb_server_proto_smb2::Header2::parse(buf.get(start..)?)?;
+        let next = header.next_command as usize;
+        if next == 0 {
+            ranges.push(start..buf.len());
+            return Some(ranges);
+        }
+        if next < hdr::LEN || !next.is_multiple_of(hdr::ALIGN) {
+            return None;
+        }
+        let end = start.checked_add(next)?;
+        if end.checked_add(hdr::LEN)? > buf.len() {
+            return None;
+        }
+        ranges.push(start..end);
+        start = end;
+    }
 }
 
 /// Body-relative offset of the 16-byte FileId within a request that carries
@@ -825,6 +853,7 @@ async fn process_single(
     server: &Arc<ServerShared>,
     conn: &mut Smb2Conn,
     buf: &[u8],
+    signed_wire: &[u8],
 ) -> Option<(Vec<u8>, bool)> {
     let hdr = match smb_server_proto_smb2::Header2::parse(buf) {
         Some(h) => h,
@@ -972,7 +1001,7 @@ async fn process_single(
         && let Some(key) = conn.signing_key
     {
         if hdr.is_signed() {
-            if !verify_pdu_signature(buf, &key, conn.dialect, conn.signing_algo) {
+            if !verify_pdu_signature(signed_wire, &key, conn.dialect, conn.signing_algo) {
                 counter!("smb_reject_bad_signature_total").increment(1);
                 return Some((
                     response(&hdr, Status::ACCESS_DENIED, Vec::new(), conn.session_id),
@@ -4759,7 +4788,7 @@ mod lease_tests {
     use crate::state::*;
     use std::collections::HashMap;
 
-    fn server_with_share(dir: &std::path::Path) -> Arc<ServerShared> {
+    pub(super) fn server_with_share(dir: &std::path::Path) -> Arc<ServerShared> {
         let vfs: Arc<dyn smb_server_vfs::Vfs> = Arc::new(smb_server_backend_posix::PosixVfs::new(dir));
         let mut shares = HashMap::new();
         shares.insert(
@@ -5345,6 +5374,88 @@ mod interface_tests {
 #[cfg(test)]
 mod signing_tests {
     use super::*;
+
+    fn signed_echo_chain(dialect: u16, algo: u16) -> Vec<u8> {
+        let mut chain = Vec::new();
+        for index in 0..2 {
+            let mut pdu = vec![0; if index == 0 { 72 } else { 68 }];
+            pdu[..4].copy_from_slice(&smb_server_proto_smb2::SMB2_MAGIC);
+            pdu[4..6].copy_from_slice(&64u16.to_le_bytes());
+            pdu[hdr::COMMAND..hdr::COMMAND + 2].copy_from_slice(&ss::cmd::ECHO.to_le_bytes());
+            pdu[hdr::FLAGS..hdr::FLAGS + 4].copy_from_slice(
+                &(hdr_flags::SIGNED | if index == 1 { hdr_flags::RELATED_OPERATIONS } else { 0 })
+                    .to_le_bytes(),
+            );
+            pdu[hdr::NEXT_COMMAND..hdr::NEXT_COMMAND + 4]
+                .copy_from_slice(&(if index == 0 { 72u32 } else { 0 }).to_le_bytes());
+            pdu[24..32].copy_from_slice(&(index as u64 + 1).to_le_bytes());
+            pdu[40..48].copy_from_slice(&7u64.to_le_bytes());
+            pdu[64..66].copy_from_slice(&4u16.to_le_bytes());
+            let signature = message_signature(&pdu, &[0x42; 16], Some(dialect), algo, false);
+            pdu[48..64].copy_from_slice(&signature);
+            chain.extend(pdu);
+        }
+        chain
+    }
+
+    fn signed_connection(dialect: u16, algo: u16) -> Smb2Conn {
+        let (sender, _) = mpsc::channel(8);
+        let mut conn = Smb2Conn::new([0; 8], sender);
+        conn.dialect = Some(dialect);
+        conn.signing_algo = algo;
+        conn.signing_key = Some([0x42; 16]);
+        conn.session_id = 7;
+        conn.authenticated = true;
+        conn
+    }
+
+    #[tokio::test]
+    async fn compound_commands_verify_separately_and_sign_final_response_layout() {
+        use smb_server_proto_smb2::negotiate::{ctx_type, DIALECT_210, DIALECT_311};
+        let temp = tempfile::tempdir().unwrap();
+        let server = super::lease_tests::server_with_share(temp.path());
+        for (dialect, algo) in [
+            (DIALECT_210, ctx_type::SIGNING_HMAC_SHA256),
+            (DIALECT_311, ctx_type::SIGNING_AES128_CMAC),
+            (DIALECT_311, ctx_type::SIGNING_AES128_GMAC),
+        ] {
+            let request = signed_echo_chain(dialect, algo);
+            let mut conn = signed_connection(dialect, algo);
+            let response = process_frame(&server, &mut conn, &request).await.unwrap();
+            assert_eq!(g32(&response, hdr::NEXT_COMMAND), 72);
+            assert_eq!(response.len(), 140);
+            for range in [0..72, 72..140] {
+                let pdu = &response[range];
+                assert_eq!(g32(pdu, hdr::STATUS), Status::SUCCESS.0);
+                assert_ne!(g32(pdu, hdr::FLAGS) & hdr_flags::SIGNED, 0);
+                let mut unsigned = pdu.to_vec();
+                unsigned[48..64].fill(0);
+                let expected = message_signature(&unsigned, &[0x42; 16], Some(dialect), algo, true);
+                assert_eq!(&pdu[48..64], &expected);
+            }
+            assert_ne!(g32(&response[72..], hdr::FLAGS) & hdr_flags::RELATED_OPERATIONS, 0);
+            let mut tampered = request;
+            tampered[72 + 66] ^= 1;
+            let rejected = process_frame(&server, &mut conn, &tampered).await.unwrap();
+            assert_eq!(g32(&rejected, hdr::STATUS), Status::SUCCESS.0);
+            assert_eq!(g32(&rejected[72..], hdr::STATUS), Status::ACCESS_DENIED.0);
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_compound_boundaries_reject_before_dispatch() {
+        use smb_server_proto_smb2::negotiate::{ctx_type, DIALECT_311};
+        let temp = tempfile::tempdir().unwrap();
+        let server = super::lease_tests::server_with_share(temp.path());
+        for next in [8u32, 65, 80, 136, u32::MAX] {
+            let mut request = signed_echo_chain(DIALECT_311, ctx_type::SIGNING_AES128_CMAC);
+            request[20..24].copy_from_slice(&next.to_le_bytes());
+            let mut conn = signed_connection(DIALECT_311, ctx_type::SIGNING_AES128_CMAC);
+            conn.client_credits = 17;
+            assert!(process_frame(&server, &mut conn, &request).await.is_none());
+            assert_eq!(conn.client_credits, 17, "no command dispatched");
+        }
+    }
 
     #[test]
     fn sign_then_verify_round_trips_and_detects_tamper() {
