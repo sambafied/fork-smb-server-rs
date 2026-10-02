@@ -17,6 +17,26 @@ mod vfs;
 
 pub use vfs::Vfs;
 
+/// An atomic-open reservation supplied by the protocol dispatcher.
+pub type OpenCheck = std::sync::Arc<dyn Fn(&str) -> VfsResult<()> + Send + Sync>;
+
+/// Parameters for an open checked before any destructive storage publication.
+#[derive(Debug, Clone, Copy)]
+pub struct CreateArgs<'a> {
+    /// Share-relative client path.
+    pub rel: &'a str,
+    /// Explicit directory request.
+    pub is_dir: bool,
+    /// Desired access mask.
+    pub access: u32,
+    /// NT create disposition.
+    pub disposition: u32,
+    /// NT create options.
+    pub options: u32,
+    /// Requested initial attributes.
+    pub attrs: u32,
+}
+
 use smb_server_proto::types::{AttrFlags, FileTime};
 
 /// An open file or directory handle owned by a backend.
@@ -143,6 +163,9 @@ pub enum VfsError {
     /// Operation not permitted for this principal.
     #[error("access denied")]
     AccessDenied,
+    /// Requested access/share mode conflicts with a live open.
+    #[error("sharing violation")]
+    SharingViolation,
     /// Directory not empty during removal.
     #[error("directory not empty")]
     DirectoryNotEmpty,

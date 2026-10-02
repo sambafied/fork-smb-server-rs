@@ -7,8 +7,16 @@ targeting, `sambafied/**` branches.
 
 - `cargo check --locked -p smb-server`, which checks the server package and its
   resolved dependencies against the committed lockfile using Rust 1.98.1.
-- Existing portable unit suites for `smb-server-auth`, `smb-server-proto`, and
-  `smb-server-vfs`.
+- Existing portable unit suites for `smb-server-auth`, `smb-server-proto`,
+  `smb-server-vfs`, `sambafied-shadow`, and `smb-server-backend-shadow`.
+
+## Self-contained shadow core
+
+The engine includes the generic `sambafied-shadow` core as source in this
+repository.  It was initially mirrored from the product at
+`f93a0fa03dd7d60e805c0aa05dfe3e4769aafa5e`; the source is currently identical
+to that version.  Engine crates use the in-repository source and have no
+private Git dependency for this core.
 
 ## Not covered
 

@@ -28,4 +28,39 @@ jobs:
         run: cargo check --locked -p smb-server
 
       - name: Run portable unit suites
-        run: cargo test --locked -p smb-server-auth -p smb-server-proto -p smb-server-vfs
+        run: cargo test --locked -p smb-server-auth -p smb-server-proto -p smb-server-vfs -p sambafied-shadow -p smb-server-backend-shadow
+
+  linux-two-user-overlay:
+    name: Native Linux two-user overlay SMB contract
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Install Rust 1.98.1
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Python 3.12
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: "3.12"
+
+      - name: Build rustsmb with the lockfile
+        run: cargo build --locked -p smb-server
+
+      - name: Run server regression tests, including io_uring denial
+        run: cargo test --locked -p smb-server
+
+      - name: Install public SMB actuator dependency
+        run: python -m pip install --requirement tests/sambafied_overlay/requirements.txt
+
+      - name: Run the real native SMB overlay contract
+        run: python tests/sambafied_overlay/run_linux_overlay.py --server-bin target/debug/rustsmb --artifacts-dir sambafied-overlay-artifacts
+
+      - name: Upload sanitized overlay evidence
+        if: always()
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08
+        with:
+          name: sambafied-native-overlay-evidence
+          path: sambafied-overlay-artifacts
+          if-no-files-found: error

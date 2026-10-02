@@ -22,6 +22,8 @@ members = [
     "crates/smb-server-transport",
     "crates/smb-server-vfs",
     "crates/smb-server-backend-posix",
+    "crates/smb-server-backend-shadow",
+    "crates/sambafied-shadow",
     "crates/smb-server-auth",
     "crates/smb-server-csp",
     "crates/smb-server",

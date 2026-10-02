@@ -17,6 +17,22 @@ use crate::{Entry, FileMeta, OpenFile, SetOp, VfsResult};
 /// All I/O must be non-blocking (io_uring / async), never blocking the runtime.
 #[async_trait(?Send)]
 pub trait Vfs: Send + Sync {
+    /// True when this backend reserves protocol sharing modes inside its
+    /// storage transaction before creating or truncating content.
+    fn atomic_open_checks(&self) -> bool {
+        false
+    }
+
+    /// Checked open for backends advertising atomic-open support. The
+    /// reservation is made using the actual private object key; the protocol
+    /// owns rollback on failure. Unsupported backends never use this path.
+    async fn create_checked(
+        &self,
+        _args: crate::CreateArgs<'_>,
+        _check: crate::OpenCheck,
+    ) -> VfsResult<(Box<OpenFile>, FileMeta, u32)> {
+        Err(crate::VfsError::NotSupported)
+    }
     /// Create or open `rel` according to the NT-style parameters.
     ///
     /// Returns the populated [`OpenFile`], a metadata snapshot and the create
