@@ -64,6 +64,7 @@ fn killed_smb_process_releases_maintenance_lease() {
             snapshot_ttl_seconds: 3600,
             recovery_protection_seconds: 300,
             trash_ttl_seconds: 3600,
+            artifacts: None,
         },
     };
     let config_file = temp.path().join("fixture.json");

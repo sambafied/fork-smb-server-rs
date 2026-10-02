@@ -17,8 +17,8 @@ prototype, not the finished overlay product and not a public API commitment.
 
 ## Internal backup management jobs
 
-The internal state format is schema 4. It records queued, running, succeeded,
-and failed receipts for capture, restore, and delete-backup work. A capture
+The internal state format is schema 5. It records queued, running, succeeded,
+and failed receipts for capture, restore, delete-backup and export work. A capture
 uses its job ID as the backup ID, so a restart can reconcile an already
 published external backup with the same receipt instead of creating a second
 backup.
@@ -55,14 +55,39 @@ Linux-native CI exercises that integration. The storage tests in this crate
 remain focused foundation evidence: they do not qualify the new backup job
 actions as a product management-plane contract.
 
+## Internal durable export artifacts
+
+`Action::Export` captures deterministic upper-layer tar archives and records
+schema-5 artifact receipts. Its stable artifact ID is the job UUID. Execution
+checks current authorization before capture and again before publication;
+publication can precede the durable local success receipt, so retry reconciles
+an existing verified archive with that same ID.
+
+Capture requires explicit server-owned `Policy.artifacts`; `None` disables
+artifact capture. Its TTL, count and byte limits are independent of snapshot
+TTL. Complete archives count against both the artifact byte limit and retained
+bytes. Registered receipts and physical orphans remain charged, including
+expired archives, until physical reclamation. Automatic expiry pruning and
+artifact deletion are not implemented.
+
+`Store::artifact(id, actor)` returns an actor-scoped receipt, not authorization.
+`Store::open_artifact(id, actor, authorize)` verifies size and SHA-256 and
+returns a rewound file descriptor, invoking current authorization before
+verification and again before return. Product API, CLI and UI integration
+remain pending. The raw `Store::export_archive` and `export_preflight` methods
+create no durable jobs or receipts and do not write `State`.
+
+See [the artifact candidate contract](../../docs/sambafied-export-artifacts.md)
+and [the raw archive contract](../../docs/sambafied-export-archives.md).
+
 ## Not implemented by this crate
 
-The new capture, restore, and delete-backup job actions are internal storage
+The new capture, restore, delete-backup and export job actions are internal storage
 work only. They are not yet exposed or qualified as product management API,
 CLI, or UI actions, and their storage primitives are not a public API contract.
 This crate does not provide public job resources, Windows 8.3 names, ACLs,
 extended attributes, alternate data streams, the retention automation service,
-crash/fault qualification, or the full API/CLI/UI parity suite. Nothing here
+broader process-kill/end-to-end fault qualification, or the full API/CLI/UI parity suite. Nothing here
 claims a deployment or release.
 
 ## Contract and evidence
@@ -78,3 +103,23 @@ Run the focused foundation suite from the repository root with:
 ```text
 cargo test -p sambafied-shadow --locked
 ```
+
+Current candidate source checks: 62 core tests (49 existing plus 13 export tests) pass
+on Windows and Linux, six
+shadow backend tests pass on Linux, and strict core Clippy passes on both.
+These checks do not establish a CI result for these changes or end-to-end
+acceptance.
+
+PR #10 merged the archive foundation at `955b46b0db53aa000b326853cb52edc7ba2095db`,
+after all four CI checks passed on `3c7ff64`. That merged foundation evidence does not
+qualify the subsequent durable artifact candidate.
+
+The additional durable regressions prove that a completed tar remains charged against
+retained capacity and can block a snapshot; quiescent schema-4-to-5 migration leaves the
+old artifact policy disabled; and a planned running retry rejects a changed TTL before
+publication, then resumes exactly once with the original binding.
+
+Source filesystem-fault tests verify private publication before a failed local
+success receipt, restart and retry reconciliation, authorization revocation, and
+changed-TTL rejection. These checks do not establish broader process-kill or
+end-to-end fault qualification.

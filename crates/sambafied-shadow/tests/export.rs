@@ -1,4 +1,7 @@
-use sambafied_shadow::{Config, Error, ExportManifest, Identity, Policy, Store};
+use sambafied_shadow::{
+    Action, ArtifactPolicy, Config, Error, ExportManifest, Identity, JobStatus, Policy,
+    RequestBinding, Store,
+};
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
@@ -37,6 +40,7 @@ fn lab() -> (tempfile::TempDir, Config) {
             snapshot_ttl_seconds: 3600,
             recovery_protection_seconds: 300,
             trash_ttl_seconds: 3600,
+            artifacts: None,
         },
     };
     (temp, config)
@@ -287,5 +291,424 @@ fn pure_preflight_matches_archive_size_and_revalidates_stale_or_corrupt_content(
     assert!(matches!(
         store.export_preflight(revision),
         Err(Error::Corrupt)
+    ));
+}
+
+fn artifact_lab() -> (tempfile::TempDir, Config) {
+    let (temp, mut config) = lab();
+    config.policy.artifacts = Some(ArtifactPolicy {
+        ttl_seconds: 3600,
+        count_limit: 4,
+        byte_limit: 8192,
+    });
+    (temp, config)
+}
+
+#[test]
+fn durable_export_job_and_verified_download_survive_reopen_without_changing_view() {
+    let (temp, config) = artifact_lab();
+    let store = Store::open(config.clone()).unwrap();
+    store.write_file("SAVE.DAT", b"save-data", "alice").unwrap();
+    store.delete("HIDDEN.DAT", "alice").unwrap();
+    let state = store.inspect().unwrap();
+    let before = tree(temp.path());
+    let preview = store
+        .preview_action(state.revision, "alice", Action::Export)
+        .unwrap();
+    assert_eq!(before, tree(temp.path()));
+    assert_eq!(preview.affected_entries, 0);
+    assert_eq!(preview.active_bytes_after, 9);
+    assert_eq!(
+        preview.retained_bytes_after,
+        store.export_preflight(state.revision).unwrap().bytes
+    );
+    let job = store
+        .submit_planned_job(
+            state.revision,
+            "alice",
+            "export",
+            Action::Export,
+            RequestBinding {
+                plan_id: uuid::Uuid::new_v4().to_string(),
+                source_fingerprint: preview.fingerprint,
+            },
+        )
+        .unwrap()
+        .job;
+    let completed = store.execute_job(&job.id, "alice", |_| Ok(())).unwrap();
+    assert_eq!(completed.status, JobStatus::Succeeded);
+    assert_eq!(
+        completed.result.as_ref().unwrap().artifact_id.as_ref(),
+        Some(&job.id)
+    );
+    let artifact = store.artifact(&job.id, "alice").unwrap();
+    assert_eq!(artifact.revision, state.revision);
+    assert_eq!(artifact.generation, state.generation);
+    assert_eq!(store.inspect().unwrap().view, state.view);
+    assert_eq!(store.inspect().unwrap().revision, state.revision + 1);
+    let archived = tree(&store.namespace().join("artifacts"));
+    assert_eq!(archived.len(), 1);
+    let mut checks = 0;
+    let (record, mut file) = store
+        .open_artifact(&job.id, "alice", |_| {
+            checks += 1;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(checks, 2);
+    let mut bytes = vec![];
+    file.read_to_end(&mut bytes).unwrap();
+    assert_eq!(record, artifact);
+    assert_eq!(format!("{:x}", Sha256::digest(&bytes)), artifact.sha256);
+    assert_eq!(bytes.len() as u64, artifact.bytes);
+    drop(store);
+    let reopened = Store::open(config.clone()).unwrap();
+    assert_eq!(
+        reopened.execute_job(&job.id, "alice", |_| Ok(())).unwrap(),
+        completed
+    );
+    assert!(
+        reopened
+            .submit_planned_job(
+                state.revision,
+                "alice",
+                "export",
+                Action::Export,
+                job.request_binding.clone().unwrap()
+            )
+            .unwrap()
+            .replayed
+    );
+    assert_eq!(archived, tree(&reopened.namespace().join("artifacts")));
+    assert!(matches!(
+        reopened.execute_job(&job.id, "alice", |_| Err(Error::Denied)),
+        Err(Error::Denied)
+    ));
+    let mut bob_config = config;
+    bob_config.identity.principal = "bob".into();
+    assert!(matches!(
+        Store::open(bob_config).unwrap().artifact(&job.id, "alice"),
+        Err(Error::NotFound)
+    ));
+    assert_eq!(
+        reopened
+            .inspect()
+            .unwrap()
+            .history
+            .iter()
+            .filter(|e| e.job_id.as_ref() == Some(&job.id))
+            .count(),
+        1
+    );
+    assert!(matches!(
+        reopened.artifact(&job.id, "bob"),
+        Err(Error::NotFound)
+    ));
+    assert!(matches!(
+        reopened.open_artifact(&job.id, "bob", |_| panic!(
+            "foreign actor must not reach authorization"
+        )),
+        Err(Error::NotFound)
+    ));
+    assert!(matches!(
+        reopened.open_artifact("../state.json", "alice", |_| Ok(())),
+        Err(Error::Path)
+    ));
+    assert!(matches!(
+        reopened.open_artifact(&job.id, "alice", |_| Err(Error::Denied)),
+        Err(Error::Denied)
+    ));
+    let mut checks = 0;
+    assert!(matches!(
+        reopened.open_artifact(&job.id, "alice", |_| {
+            checks += 1;
+            if checks == 2 {
+                Err(Error::Denied)
+            } else {
+                Ok(())
+            }
+        }),
+        Err(Error::Denied)
+    ));
+}
+
+#[test]
+fn export_denial_and_disabled_or_exhausted_policy_never_publish() {
+    let (temp, mut config) = artifact_lab();
+    config.policy.artifacts.as_mut().unwrap().count_limit = 1;
+    let store = Store::open(config.clone()).unwrap();
+    let revision = store.inspect().unwrap().revision;
+    let job = store
+        .submit_job(revision, "alice", "denied", Action::Export)
+        .unwrap()
+        .job;
+    let mut checks = 0;
+    let failed = store
+        .execute_job(&job.id, "alice", |_| {
+            checks += 1;
+            if checks == 2 {
+                Err(Error::Denied)
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap();
+    assert_eq!(failed.status, JobStatus::Failed);
+    assert_eq!(failed.error_code.as_deref(), Some("denied"));
+    assert!(!store.namespace().join("artifacts").exists());
+    assert!(store.inspect().unwrap().artifacts.is_empty());
+    let job = store
+        .submit_job(revision, "alice", "ok", Action::Export)
+        .unwrap()
+        .job;
+    assert_eq!(
+        store
+            .execute_job(&job.id, "alice", |_| Ok(()))
+            .unwrap()
+            .status,
+        JobStatus::Succeeded
+    );
+    let before = tree(temp.path());
+    let revision = store.inspect().unwrap().revision;
+    assert!(matches!(
+        store.preview_action(revision, "alice", Action::Export),
+        Err(Error::Quota)
+    ));
+    assert_eq!(before, tree(temp.path()));
+    let mut disabled = config.clone();
+    disabled.policy.artifacts = None;
+    assert!(matches!(
+        Store::open(disabled)
+            .unwrap()
+            .preview_action(revision, "alice", Action::Export),
+        Err(Error::Unsupported)
+    ));
+    config.policy.artifacts.as_mut().unwrap().ttl_seconds = 0;
+    assert!(matches!(Store::open(config), Err(Error::Quota)));
+}
+
+#[test]
+fn archive_expiry_corruption_and_schema_smuggling_fail_closed() {
+    let (_temp, config) = artifact_lab();
+    let store = Store::open(config.clone()).unwrap();
+    let job = store
+        .submit_job(0, "alice", "capture", Action::Export)
+        .unwrap()
+        .job;
+    store.execute_job(&job.id, "alice", |_| Ok(())).unwrap();
+    let path = store.namespace().join("state.json");
+    let original = fs::read(&path).unwrap();
+    let mut state: serde_json::Value = serde_json::from_slice(&original).unwrap();
+    state["schema"] = 4.into();
+    fs::write(&path, serde_json::to_vec(&state).unwrap()).unwrap();
+    assert!(matches!(Store::open(config.clone()), Err(Error::Corrupt)));
+    state["schema"] = 5.into();
+    state["artifacts"][&job.id]["createdAt"] = 0.into();
+    state["jobs"][&job.id]["created_at"] = 0.into();
+    state["artifacts"][&job.id]["expiresAt"] = 1.into();
+    fs::write(&path, serde_json::to_vec(&state).unwrap()).unwrap();
+    assert!(matches!(
+        store.open_artifact(&job.id, "alice", |_| panic!(
+            "expired archive must not reach authorization"
+        )),
+        Err(Error::Retention)
+    ));
+    // Expiry does not free count or retained capacity.
+    let mut limited = config.clone();
+    limited.policy.artifacts.as_mut().unwrap().count_limit = 1;
+    assert!(matches!(
+        Store::open(limited)
+            .unwrap()
+            .preview_action(1, "alice", Action::Export),
+        Err(Error::Quota)
+    ));
+    fs::write(&path, &original).unwrap();
+    let archive = store
+        .namespace()
+        .join("artifacts")
+        .join(format!("{}.tar", job.id));
+    let mut bytes = fs::read(&archive).unwrap();
+    bytes[513] ^= 1;
+    fs::write(&archive, bytes).unwrap();
+    assert!(matches!(
+        store.open_artifact(&job.id, "alice", |_| Ok(())),
+        Err(Error::Corrupt)
+    ));
+    state = serde_json::from_slice(&original).unwrap();
+    state["jobs"][&job.id]["status"] = "running".into();
+    fs::write(&path, serde_json::to_vec(&state).unwrap()).unwrap();
+    assert!(matches!(Store::open(config), Err(Error::Corrupt)));
+}
+
+#[test]
+fn private_publication_without_receipt_resumes_once_after_reopen() {
+    let (_temp, config) = artifact_lab();
+    let store = Store::open(config.clone()).unwrap();
+    store.write_file("SAVE.DAT", b"save-data", "alice").unwrap();
+    let revision = store.inspect().unwrap().revision;
+    let preview = store
+        .preview_action(revision, "alice", Action::Export)
+        .unwrap();
+    let job = store
+        .submit_planned_job(
+            revision,
+            "alice",
+            "interrupted",
+            Action::Export,
+            RequestBinding {
+                plan_id: uuid::Uuid::new_v4().to_string(),
+                source_fingerprint: preview.fingerprint,
+            },
+        )
+        .unwrap()
+        .job;
+    let state = store.namespace().join("state.json");
+    let retained = store.namespace().join("interrupted-state.json");
+    let mut checks = 0;
+    assert!(
+        store
+            .execute_job(&job.id, "alice", |_| {
+                checks += 1;
+                if checks == 2 {
+                    fs::rename(&state, &retained).unwrap();
+                    fs::create_dir(&state).unwrap();
+                }
+                Ok(())
+            })
+            .is_err()
+    );
+    fs::remove_dir(&state).unwrap();
+    fs::rename(&retained, &state).unwrap();
+    let archives = tree(&store.namespace().join("artifacts"));
+    assert_eq!(archives.len(), 1);
+    assert!(store.inspect().unwrap().artifacts.is_empty());
+    assert!(matches!(
+        store.artifact(&job.id, "alice"),
+        Err(Error::NotFound)
+    ));
+    drop(store);
+    let reopened = Store::open(config.clone()).unwrap();
+    assert!(matches!(
+        reopened.execute_job(&job.id, "alice", |_| Err(Error::Denied)),
+        Err(Error::Denied)
+    ));
+    assert_eq!(
+        reopened.inspect().unwrap().jobs[&job.id].status,
+        JobStatus::Running
+    );
+    let mut changed = config;
+    changed.policy.artifacts.as_mut().unwrap().ttl_seconds += 1;
+    let changed_store = Store::open(changed).unwrap();
+    assert!(matches!(
+        changed_store.execute_job(&job.id, "alice", |_| Ok(())),
+        Err(Error::Revision)
+    ));
+    assert_eq!(
+        changed_store.inspect().unwrap().jobs[&job.id].status,
+        JobStatus::Running
+    );
+    drop(changed_store);
+    let completed = reopened.execute_job(&job.id, "alice", |_| Ok(())).unwrap();
+    assert_eq!(completed.status, JobStatus::Succeeded);
+    assert_eq!(archives, tree(&reopened.namespace().join("artifacts")));
+    assert_eq!(
+        reopened
+            .inspect()
+            .unwrap()
+            .history
+            .iter()
+            .filter(|e| e.job_id.as_ref() == Some(&job.id))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn unpublished_archives_and_completed_tar_bytes_remain_charged_to_retained_budget() {
+    let (_temp, mut config) = artifact_lab();
+    let store = Store::open(config.clone()).unwrap();
+    let orphan_dir = store.namespace().join("artifacts");
+    fs::create_dir(&orphan_dir).unwrap();
+    let orphan = uuid::Uuid::new_v4().to_string();
+    fs::write(orphan_dir.join(format!("{orphan}.tar")), vec![0; 8192]).unwrap();
+    assert!(matches!(
+        store.preview_action(0, "alice", Action::Export),
+        Err(Error::Quota)
+    ));
+    // Even without export enabled, a retained snapshot cannot hide orphan bytes.
+    config.policy.artifacts = None;
+    let reopened = Store::open(config).unwrap();
+    reopened
+        .write_file("SAVE.DAT", b"save-data", "alice")
+        .unwrap();
+    assert!(matches!(reopened.snapshot(1, "alice"), Err(Error::Quota)));
+    assert!(reopened.inspect().unwrap().snapshots.is_empty());
+    assert!(matches!(
+        reopened.artifact(&orphan, "alice"),
+        Err(Error::NotFound)
+    ));
+}
+
+#[test]
+fn completed_tar_charges_retained_capacity_without_mutating_saved_data() {
+    let (_temp, mut config) = artifact_lab();
+    let store = Store::open(config.clone()).unwrap();
+    store.write_file("SAVE.DAT", b"save-data", "alice").unwrap();
+    let revision = store.inspect().unwrap().revision;
+    let bytes = store.export_preflight(revision).unwrap().bytes;
+    drop(store);
+    config.policy.retained_bytes = bytes;
+    config.policy.artifacts.as_mut().unwrap().byte_limit = bytes;
+    let store = Store::open(config).unwrap();
+    let job = store
+        .submit_job(revision, "alice", "capture", Action::Export)
+        .unwrap()
+        .job;
+    assert_eq!(
+        store
+            .execute_job(&job.id, "alice", |_| Ok(()))
+            .unwrap()
+            .status,
+        JobStatus::Succeeded
+    );
+    assert!(matches!(
+        store.snapshot(revision + 1, "alice"),
+        Err(Error::Quota)
+    ));
+    assert!(store.inspect().unwrap().snapshots.is_empty());
+    assert_eq!(store.read("SAVE.DAT").unwrap(), b"save-data");
+}
+
+#[test]
+fn schema_four_receipts_migrate_only_when_quiescent_and_old_policy_disables_exports() {
+    let (_temp, config) = lab();
+    let store = Store::open(config.clone()).unwrap();
+    let job = store
+        .submit_job(0, "alice", "old-snapshot", Action::Snapshot)
+        .unwrap()
+        .job;
+    let completed = store.execute_job(&job.id, "alice", |_| Ok(())).unwrap();
+    let before = store.inspect().unwrap();
+    let path = store.namespace().join("state.json");
+    let mut persisted = serde_json::to_value(&before).unwrap();
+    persisted["schema"] = 4.into();
+    fs::write(path, serde_json::to_vec(&persisted).unwrap()).unwrap();
+    let lease = store.lease().unwrap();
+    assert!(matches!(Store::open(config.clone()), Err(Error::Busy)));
+    drop(lease);
+    let migrated = Store::open(config.clone()).unwrap();
+    let after = migrated.inspect().unwrap();
+    assert_eq!(after.schema, 5);
+    assert_eq!(after.generation, before.generation);
+    assert_eq!(after.revision, before.revision);
+    assert_eq!(after.view, before.view);
+    assert_eq!(migrated.job(&job.id, "alice").unwrap(), completed);
+    let mut old_policy = serde_json::to_value(&config.policy).unwrap();
+    old_policy.as_object_mut().unwrap().remove("artifacts");
+    let policy: Policy = serde_json::from_value(old_policy).unwrap();
+    assert!(policy.artifacts.is_none());
+    assert!(matches!(
+        migrated.preview_action(after.revision, "alice", Action::Export),
+        Err(Error::Unsupported)
     ));
 }

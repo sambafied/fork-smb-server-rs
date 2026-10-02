@@ -6,6 +6,9 @@
 //! counterpart. The lease works across the API and SMB engine processes.
 #![forbid(unsafe_code)]
 
+mod artifacts;
+pub use artifacts::{ArtifactPolicy, ExportArtifact};
+
 mod backup_jobs;
 mod export;
 mod management;
@@ -82,10 +85,15 @@ pub struct Policy {
     pub snapshot_ttl_seconds: u64,
     pub recovery_protection_seconds: u64,
     pub trash_ttl_seconds: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifacts: Option<ArtifactPolicy>,
 }
 
 impl Policy {
     fn validate(&self) -> Result<()> {
+        if let Some(artifacts) = &self.artifacts {
+            artifacts.validate(self.retained_bytes)?;
+        }
         if self.active_bytes == 0
             || self.active_files == 0
             || self.max_file_bytes == 0
@@ -209,6 +217,8 @@ pub struct State {
     pub history: Vec<Event>,
     #[serde(default)]
     pub jobs: BTreeMap<String, Job>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub artifacts: BTreeMap<String, ExportArtifact>,
 }
 
 #[derive(Debug)]
@@ -413,15 +423,15 @@ impl Store {
         let _serial = store.serial()?;
         if store.state_path().exists() {
             let mut state = store.load()?;
-            if state.schema < 4 {
+            if state.schema < 5 {
                 let _maintenance = store.maintenance()?;
-                state.schema = 4;
+                state.schema = 5;
                 store.save(&state)?;
             }
             store.collect_blobs(&state)?;
         } else {
             store.save(&State {
-                schema: 4,
+                schema: 5,
                 identity: store.config.identity.clone(),
                 base_digest: store.base_digest.clone(),
                 generation: id(),
@@ -432,6 +442,7 @@ impl Store {
                 backups: BTreeMap::new(),
                 history: Vec::new(),
                 jobs: BTreeMap::new(),
+                artifacts: BTreeMap::new(),
             })?;
         }
         drop(_serial);
@@ -456,19 +467,22 @@ impl Store {
     fn load(&self) -> Result<State> {
         let state: State =
             serde_json::from_slice(&bounded_read(&self.state_path(), 16 * 1024 * 1024)?)?;
-        if !matches!(state.schema, 1..=4)
+        if !matches!(state.schema, 1..=5)
             || (state.schema == 1 && !state.jobs.is_empty())
             || state.jobs.values().any(|job| {
-                (state.schema < 4
-                    && (matches!(
-                        job.action,
-                        Action::Backup { .. }
-                            | Action::RestoreBackup { .. }
-                            | Action::DeleteBackup { .. }
-                    ) || job
-                        .result
-                        .as_ref()
-                        .is_some_and(|result| result.backup_id.is_some())))
+                (state.schema < 5
+                    && (job.action == Action::Export
+                        || job.result.as_ref().is_some_and(|r| r.artifact_id.is_some())))
+                    || (state.schema < 4
+                        && (matches!(
+                            job.action,
+                            Action::Backup { .. }
+                                | Action::RestoreBackup { .. }
+                                | Action::DeleteBackup { .. }
+                        ) || job
+                            .result
+                            .as_ref()
+                            .is_some_and(|result| result.backup_id.is_some())))
                     || job
                         .request_binding
                         .as_ref()
@@ -480,6 +494,7 @@ impl Store {
         {
             return Err(Error::Corrupt);
         }
+        self.validate_artifacts(&state)?;
         Ok(state)
     }
     fn save(&self, state: &State) -> Result<()> {
@@ -916,6 +931,12 @@ impl Store {
             )
             .try_fold(0u64, |sum, size| sum.checked_add(size))
             .ok_or(Error::Quota)?;
+        let artifact_bytes = self
+            .artifact_usage(state)?
+            .values()
+            .try_fold(0u64, |sum, bytes| sum.checked_add(*bytes))
+            .ok_or(Error::Quota)?;
+        let retained = retained.checked_add(artifact_bytes).ok_or(Error::Quota)?;
         if active > policy.active_bytes
             || state.view.upper.len() > policy.active_files
             || retained > policy.retained_bytes

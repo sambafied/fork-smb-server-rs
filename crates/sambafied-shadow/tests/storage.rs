@@ -36,6 +36,7 @@ impl Lab {
                 snapshot_ttl_seconds: 3600,
                 recovery_protection_seconds: 300,
                 trash_ttl_seconds: 3600,
+                artifacts: None,
             },
         };
         Self {
