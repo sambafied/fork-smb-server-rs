@@ -1038,6 +1038,26 @@ impl Store {
         let path = current.handle_path(&state, handle)?;
         current.delete_locked(&mut state, path, actor)
     }
+    /// Validate delete-pending without publishing a deletion or trash record.
+    /// The protocol adapter must reject nonempty directories before acknowledging
+    /// delete-on-close or a delete disposition; close rechecks actual deletion.
+    pub fn check_delete_handle(&self, handle: &Handle) -> Result<()> {
+        if self.namespace != handle.store.namespace {
+            return Err(Error::Corrupt);
+        }
+        let operation = self.serial()?;
+        let current = &operation.store;
+        let state = current.load()?;
+        if state.generation != handle.generation {
+            return Err(Error::Revision);
+        }
+        let path = current.handle_path(&state, handle)?;
+        let entry = current.lookup(&state.view, &path).ok_or(Error::NotFound)?;
+        if entry.directory && !current.listing(&state.view, &path)?.is_empty() {
+            return Err(Error::NotEmpty);
+        }
+        Ok(())
+    }
     fn delete_locked(&self, state: &mut State, path: String, actor: &str) -> Result<String> {
         if path.is_empty() {
             return Err(Error::Path);

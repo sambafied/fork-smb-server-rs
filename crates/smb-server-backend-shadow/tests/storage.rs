@@ -11,6 +11,100 @@ const READ: u32 = 0x8000_0000;
 const WRITE: u32 = 0x4000_0000;
 const DELETE: u32 = 0x0001_0000;
 
+#[tokio::test(flavor = "current_thread")]
+async fn nonempty_directory_deletion_is_rejected_before_pending_acknowledgement() {
+    let lab = Lab::new();
+    fs::create_dir(lab.config.base.join("LOWER")).unwrap();
+    fs::write(lab.config.base.join("LOWER/CHILD.TXT"), b"base child").unwrap();
+    let alice = lab.alice();
+    let manager = Store::open(lab.config.clone()).unwrap();
+    manager.mkdir("upper", "alice").unwrap();
+    manager
+        .write_file("upper/child.txt", b"private child", "alice")
+        .unwrap();
+    for directory in ["lower", "upper"] {
+        let before = fs::read(manager.namespace().join("state.json")).unwrap();
+        assert!(matches!(
+            alice
+                .create(directory, true, READ | DELETE, 1, 1 | 0x1000, 0x10)
+                .await,
+            Err(VfsError::DirectoryNotEmpty)
+        ));
+        let (mut open, _, _) = alice
+            .create(directory, true, READ | DELETE, 1, 1, 0x10)
+            .await
+            .unwrap();
+        assert!(matches!(
+            alice
+                .set_info_open(&mut open, &SetOp::Disposition { delete: true })
+                .await,
+            Err(VfsError::DirectoryNotEmpty)
+        ));
+        assert!(!open.delete_pending);
+        alice.close(open).await.unwrap();
+        assert_eq!(
+            fs::read(manager.namespace().join("state.json")).unwrap(),
+            before
+        );
+        assert!(manager.stat(directory).unwrap().directory);
+    }
+    assert_eq!(manager.read("lower/child.txt").unwrap(), b"base child");
+    assert_eq!(manager.read("upper/child.txt").unwrap(), b"private child");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn pending_directory_blocks_child_create_mkdir_and_rename_until_cancelled() {
+    let lab = Lab::new();
+    let alice = lab.alice();
+    alice.mkdir("empty").await.unwrap();
+    let (mut directory, _, _) = alice
+        .create("empty", true, READ | DELETE, 1, 1, 0x10)
+        .await
+        .unwrap();
+    alice
+        .set_info_open(&mut directory, &SetOp::Disposition { delete: true })
+        .await
+        .unwrap();
+    assert!(matches!(
+        alice
+            .create("empty/child.txt", false, READ | WRITE, 2, 0x40, 0x80)
+            .await,
+        Err(VfsError::AccessDenied)
+    ));
+    assert!(matches!(
+        alice.mkdir("empty/child").await,
+        Err(VfsError::AccessDenied)
+    ));
+    let (mut source, _, _) = alice
+        .create("source.txt", false, READ | WRITE | DELETE, 2, 0x40, 0x80)
+        .await
+        .unwrap();
+    assert!(matches!(
+        alice
+            .set_info_open(
+                &mut source,
+                &SetOp::Rename {
+                    replace_if_exists: false,
+                    name: "empty/source.txt".into()
+                }
+            )
+            .await,
+        Err(VfsError::AccessDenied)
+    ));
+    alice
+        .set_info_open(&mut directory, &SetOp::Disposition { delete: false })
+        .await
+        .unwrap();
+    let (child, _, _) = alice
+        .create("empty/child.txt", false, READ | WRITE, 2, 0x40, 0x80)
+        .await
+        .unwrap();
+    alice.close(child).await.unwrap();
+    alice.close(source).await.unwrap();
+    alice.close(directory).await.unwrap();
+    assert!(alice.stat("empty/child.txt").await.is_ok());
+}
+
 struct Lab {
     _temp: tempfile::TempDir,
     config: Config,
