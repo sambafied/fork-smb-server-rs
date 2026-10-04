@@ -2,6 +2,13 @@
 //! Callers supply current scoped authority; these are storage primitives only.
 use super::*;
 
+/// Physical usage and temporal counts observed under the same manifest lease.
+#[derive(Debug, Clone)]
+pub struct StorageObservation {
+    pub observed_at: u64,
+    pub usage: StorageUsage,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct StorageUsage {
@@ -14,6 +21,9 @@ pub struct StorageUsage {
     pub expired_snapshot_count: usize,
     pub expired_trash_count: usize,
     pub expired_artifact_count: usize,
+    pub retired_artifact_count: usize,
+    pub retired_artifact_physical_count: usize,
+    pub retired_artifact_physical_bytes: u64,
     pub protected_snapshot_count: usize,
     pub unresolved_job_count: usize,
     /// Physical payload sizes, excluding manifests, locks and external backups.
@@ -30,6 +40,8 @@ pub struct StorageUsage {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ExpiryPreview {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifacts: Vec<String>,
     pub revision: u64,
     pub generation: String,
     pub observed_at: u64,
@@ -54,6 +66,8 @@ pub struct ExpiryResult {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RetentionJobResult {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifacts: Vec<String>,
     pub expired_before: u64,
     pub snapshots: Vec<String>,
     pub trash: Vec<String>,
@@ -86,7 +100,13 @@ impl Store {
                         .filter(|trash| trash.from_upper)
                         .map(|trash| trash.entry.size),
                 )
-                .chain(state.artifacts.values().map(|artifact| artifact.bytes)),
+                .chain(
+                    state
+                        .artifacts
+                        .values()
+                        .filter(|a| a.retirement.is_none())
+                        .map(|artifact| artifact.bytes),
+                ),
         )?;
         let referenced: BTreeSet<_> = state
             .view
@@ -134,7 +154,13 @@ impl Store {
                 .collect::<Result<Vec<_>>>()?,
         )?;
         let physical_artifacts = self.physical_artifacts()?;
-        let registered_artifacts = total(state.artifacts.values().map(|artifact| artifact.bytes))?;
+        let registered_artifacts = total(
+            state
+                .artifacts
+                .values()
+                .filter(|a| a.retirement.is_none())
+                .map(|artifact| artifact.bytes),
+        )?;
         let charged_artifacts = total(self.artifact_usage(state)?.values().copied())?;
         let retained_charged_bytes = retained_bytes
             .checked_sub(registered_artifacts)
@@ -154,8 +180,33 @@ impl Store {
             expired_artifact_count: state
                 .artifacts
                 .values()
-                .filter(|a| a.expires_at <= at)
+                .filter(|a| a.retirement.is_none() && a.expires_at <= at)
                 .count(),
+            retired_artifact_count: state
+                .artifacts
+                .values()
+                .filter(|a| a.retirement.is_some())
+                .count(),
+            retired_artifact_physical_count: physical_artifacts
+                .keys()
+                .filter(|id| {
+                    state
+                        .artifacts
+                        .get(*id)
+                        .is_some_and(|a| a.retirement.is_some())
+                })
+                .count(),
+            retired_artifact_physical_bytes: total(
+                physical_artifacts
+                    .iter()
+                    .filter(|(id, _)| {
+                        state
+                            .artifacts
+                            .get(*id)
+                            .is_some_and(|a| a.retirement.is_some())
+                    })
+                    .map(|(_, bytes)| *bytes),
+            )?,
             protected_snapshot_count: state
                 .snapshots
                 .values()
@@ -185,8 +236,10 @@ impl Store {
                 .count(),
             artifact_missing_count: state
                 .artifacts
-                .keys()
-                .filter(|id| !physical_artifacts.contains_key(*id))
+                .iter()
+                .filter(|(id, artifact)| {
+                    artifact.retirement.is_none() && !physical_artifacts.contains_key(*id)
+                })
                 .count(),
         })
     }
@@ -221,6 +274,7 @@ impl Store {
             return Err(Error::Corrupt);
         }
         Ok(ExpiryPreview {
+            artifacts: vec![],
             revision: state.revision,
             generation: state.generation.clone(),
             observed_at: at,
@@ -280,6 +334,51 @@ impl Store {
                 Some(record.path),
                 Some(trash.clone()),
             )?;
+        }
+        Ok(preview)
+    }
+
+    pub(crate) fn retire_artifacts_locked(
+        &self,
+        state: &mut State,
+        actor: &str,
+        cutoff: u64,
+        own_job: Option<&str>,
+    ) -> Result<ExpiryPreview> {
+        let mut source = state.clone();
+        if let Some(job) = own_job {
+            source.jobs.remove(job);
+        }
+        let mut preview = self.expiry_preview_locked(&source, cutoff)?;
+        preview.snapshots.clear();
+        preview.trash.clear();
+        preview.artifacts = state
+            .artifacts
+            .values()
+            .filter(|a| a.retirement.is_none() && a.expires_at <= cutoff)
+            .map(|a| a.id.clone())
+            .collect();
+        if state
+            .history
+            .len()
+            .checked_add(preview.artifacts.len())
+            .is_none_or(|n| n > self.config.policy.history_limit)
+        {
+            return Err(Error::Quota);
+        }
+        for id in &preview.artifacts {
+            self.event(state, actor, "expire-artifact", None, Some(id.clone()))?;
+            let retirement = ArtifactRetirement {
+                job_id: own_job.unwrap_or("preview").into(),
+                at: now(),
+                expired_before: cutoff,
+                revision: state.revision,
+            };
+            state
+                .artifacts
+                .get_mut(id)
+                .ok_or(Error::Corrupt)?
+                .retirement = Some(retirement);
         }
         Ok(preview)
     }

@@ -8,6 +8,9 @@ const JOB_LIMIT: usize = 1024;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "action", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum Action {
+    ExpireArtifacts {
+        expired_before: u64,
+    },
     ExpireRetained {
         expired_before: u64,
     },
@@ -136,7 +139,9 @@ pub struct ActionImpact {
 
 impl Action {
     fn validate(&self) -> Result<()> {
-        if let Self::ExpireRetained { expired_before } = self {
+        if let Self::ExpireRetained { expired_before } | Self::ExpireArtifacts { expired_before } =
+            self
+        {
             return if *expired_before <= now() {
                 Ok(())
             } else {
@@ -158,7 +163,8 @@ impl Action {
             | Self::Export
             | Self::Reset
             | Self::Backup { .. }
-            | Self::ExpireRetained { .. } => return Ok(()),
+            | Self::ExpireRetained { .. }
+            | Self::ExpireArtifacts { .. } => return Ok(()),
             Self::Rollback { snapshot_id } | Self::DeleteSnapshot { snapshot_id } => snapshot_id,
             Self::RestoreTrash { trash_id } | Self::PurgeTrash { trash_id } => trash_id,
             Self::RestoreBackup { backup_id, .. } | Self::DeleteBackup { backup_id, .. } => {
@@ -222,6 +228,15 @@ impl Store {
         let mut staged = original.clone();
         let mut retention = None;
         match &action {
+            Action::ExpireArtifacts { expired_before } => {
+                retention = Some(current.retire_artifacts_locked(
+                    &mut staged,
+                    actor,
+                    *expired_before,
+                    None,
+                )?);
+                current.event(&mut staged, actor, "expire-artifacts", None, None)?;
+            }
             Action::ExpireRetained { expired_before } => {
                 retention =
                     Some(current.expire_locked(&mut staged, actor, *expired_before, None)?);
@@ -348,6 +363,7 @@ impl Store {
                 action,
                 Action::PurgeTrash { .. }
                     | Action::ExpireRetained { .. }
+                    | Action::ExpireArtifacts { .. }
                     | Action::DeleteSnapshot { .. }
                     | Action::DeleteBackup { .. }
             ),
@@ -438,8 +454,10 @@ impl Store {
         }
         current.revision(&state, expected)?;
         if state.jobs.values().any(|job| {
-            matches!(job.action, Action::ExpireRetained { .. })
-                && matches!(job.status, JobStatus::Queued | JobStatus::Running)
+            matches!(
+                job.action,
+                Action::ExpireRetained { .. } | Action::ExpireArtifacts { .. }
+            ) && matches!(job.status, JobStatus::Queued | JobStatus::Running)
         }) {
             return Err(Error::Busy);
         }
@@ -453,7 +471,10 @@ impl Store {
             return Err(Error::Quota);
         }
         let at = now();
-        if matches!(action, Action::ExpireRetained { .. }) {
+        if matches!(
+            action,
+            Action::ExpireRetained { .. } | Action::ExpireArtifacts { .. }
+        ) {
             // Reject concurrent accepted work before creating another durable job.
             if state
                 .jobs
@@ -462,7 +483,11 @@ impl Store {
             {
                 return Err(Error::Busy);
             }
-            state.schema = 6;
+            state.schema = if matches!(action, Action::ExpireArtifacts { .. }) {
+                7
+            } else {
+                state.schema.max(6)
+            };
         }
         let job = Job {
             id: id(),
@@ -619,11 +644,39 @@ impl Store {
             let mut deletion = None;
             let mut export = None;
             match &job.action {
+                Action::ExpireArtifacts { expired_before } => {
+                    let retired = current.retire_artifacts_locked(
+                        &mut staged,
+                        actor,
+                        *expired_before,
+                        Some(job_id),
+                    )?;
+                    let usage = current.storage_usage_locked(&staged, now())?;
+                    result.retention = Some(RetentionJobResult {
+                        artifacts: retired.artifacts,
+                        expired_before: *expired_before,
+                        snapshots: vec![],
+                        trash: vec![],
+                        retained_bytes_after: usage.retained_charged_bytes,
+                        reclaimed_bytes: 0,
+                        deferred_blob_bytes: usage.blob_unreferenced_bytes,
+                        physical_reclamation_deferred: usage.retired_artifact_physical_count > 0
+                            || usage.artifact_orphan_count > 0,
+                    });
+                    current.event(
+                        &mut staged,
+                        actor,
+                        "expire-artifacts",
+                        None,
+                        Some(job.id.clone()),
+                    )?;
+                }
                 Action::ExpireRetained { expired_before } => {
                     let expired =
                         current.expire_locked(&mut staged, actor, *expired_before, Some(job_id))?;
                     let usage = current.storage_usage_locked(&staged, now())?;
                     result.retention = Some(RetentionJobResult {
+                        artifacts: vec![],
                         expired_before: *expired_before,
                         snapshots: expired.snapshots,
                         trash: expired.trash,

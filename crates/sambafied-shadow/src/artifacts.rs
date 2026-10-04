@@ -25,6 +25,8 @@ impl ArtifactPolicy {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ExportArtifact {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retirement: Option<ArtifactRetirement>,
     pub id: String,
     pub actor: String,
     pub identity: Identity,
@@ -34,6 +36,16 @@ pub struct ExportArtifact {
     pub expires_at: u64,
     pub bytes: u64,
     pub sha256: String,
+}
+
+/// Durable expiry authority; the original export metadata and receipt remain.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ArtifactRetirement {
+    pub job_id: String,
+    pub at: u64,
+    pub expired_before: u64,
+    pub revision: u64,
 }
 
 pub(crate) struct ArtifactCapture {
@@ -93,7 +105,11 @@ impl Store {
     }
     pub(crate) fn artifact_usage(&self, state: &State) -> Result<BTreeMap<String, u64>> {
         let mut physical = self.physical_artifacts()?;
-        for (id, artifact) in &state.artifacts {
+        for (id, artifact) in state
+            .artifacts
+            .iter()
+            .filter(|(_, a)| a.retirement.is_none())
+        {
             physical
                 .entry(id.clone())
                 .and_modify(|bytes| *bytes = (*bytes).max(artifact.bytes))
@@ -120,6 +136,27 @@ impl Store {
                     .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
             {
                 return Err(Error::Corrupt);
+            }
+            if let Some(retirement) = &artifact.retirement {
+                let job = state.jobs.get(&retirement.job_id).ok_or(Error::Corrupt)?;
+                let result = job.result.as_ref().ok_or(Error::Corrupt)?;
+                let receipt = result.retention.as_ref().ok_or(Error::Corrupt)?;
+                if state.schema < 7
+                    || retirement.expired_before < artifact.expires_at
+                    || retirement.expired_before > retirement.at
+                    || retirement.revision <= artifact.revision
+                    || retirement.revision > result.revision
+                    || result.revision > state.revision
+                    || job.status != JobStatus::Succeeded
+                    || job.action
+                        != (Action::ExpireArtifacts {
+                            expired_before: retirement.expired_before,
+                        })
+                    || receipt.expired_before != retirement.expired_before
+                    || !receipt.artifacts.contains(id)
+                {
+                    return Err(Error::Corrupt);
+                }
             }
             let job = state.jobs.get(id).ok_or(Error::Corrupt)?;
             if job.status != JobStatus::Succeeded
@@ -186,6 +223,7 @@ impl Store {
         }
         Ok(ArtifactCapture {
             artifact: ExportArtifact {
+                retirement: None,
                 id: artifact_id.to_owned(),
                 actor: actor.to_owned(),
                 identity: state.identity.clone(),
@@ -226,6 +264,25 @@ impl Store {
         }
         Ok(())
     }
+    /// Collect only durably retired, checksum-verified owned archives. A failed
+    /// collection leaves its payload charged and the committed retirement intact.
+    pub(crate) fn collect_retired_artifacts(&self, state: &State) -> Result<()> {
+        for artifact in state.artifacts.values().filter(|a| a.retirement.is_some()) {
+            let path = self.artifact_path(&artifact.id)?;
+            match fs::symlink_metadata(&path) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e.into()),
+                Ok(_) => {}
+            }
+            // Drop the verified descriptor before unlinking on Windows.
+            drop(self.verify_artifact_file(artifact)?);
+            fs::remove_file(&path)?;
+            #[cfg(unix)]
+            File::open(self.artifacts_dir()?)?.sync_all()?;
+        }
+        Ok(())
+    }
+
     fn verify_artifact_file(&self, artifact: &ExportArtifact) -> Result<File> {
         let path = self.artifact_path(&artifact.id)?;
         let meta = fs::symlink_metadata(&path)?;
@@ -262,7 +319,7 @@ impl Store {
         let artifact = state
             .artifacts
             .get(artifact_id)
-            .filter(|a| a.actor == actor)
+            .filter(|a| a.actor == actor && a.retirement.is_none())
             .ok_or(Error::NotFound)?;
         if artifact.expires_at <= now() {
             return Err(Error::Retention);
@@ -287,7 +344,7 @@ impl Store {
         let artifact = state
             .artifacts
             .get(artifact_id)
-            .filter(|a| a.actor == actor)
+            .filter(|a| a.actor == actor && a.retirement.is_none())
             .ok_or(Error::NotFound)?;
         if artifact.expires_at <= now() {
             return Err(Error::Retention);

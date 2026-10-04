@@ -638,3 +638,492 @@ fn planned_expiry_requires_capacity_for_completion_and_current_authority() {
         Err(Error::Path)
     ));
 }
+
+fn artifact_lab() -> Lab {
+    let mut lab = Lab::new();
+    lab.config.policy.retained_bytes = 32768;
+    lab.config.policy.temporary_bytes = 16384;
+    lab.config.policy.artifacts = Some(sambafied_shadow::ArtifactPolicy {
+        ttl_seconds: 3600,
+        count_limit: 3,
+        byte_limit: 32768,
+    });
+    lab
+}
+fn export_job(store: &Store, key: &str) -> sambafied_shadow::Job {
+    let revision = store.inspect().unwrap().revision;
+    let accepted = store
+        .submit_job(revision, "alice", key, sambafied_shadow::Action::Export)
+        .unwrap();
+    let completed = store
+        .execute_job(&accepted.job.id, "alice", |_| Ok(()))
+        .unwrap();
+    assert_eq!(completed.status, sambafied_shadow::JobStatus::Succeeded);
+    completed
+}
+fn age_artifact(store: &Store, id: &str, expiry: u64) {
+    rewrite(store, |state| {
+        let artifact = state.artifacts.get_mut(id).unwrap();
+        artifact.created_at = 0;
+        artifact.expires_at = expiry;
+        state.jobs.get_mut(id).unwrap().created_at = 0;
+    });
+}
+fn submit_artifact_expiry(store: &Store, cutoff: u64, key: &str) -> sambafied_shadow::Job {
+    use sambafied_shadow::{Action, RequestBinding};
+    let revision = store.inspect().unwrap().revision;
+    let action = Action::ExpireArtifacts {
+        expired_before: cutoff,
+    };
+    let preview = store
+        .preview_planned_action(revision, "alice", action.clone())
+        .unwrap();
+    store
+        .submit_planned_job(
+            revision,
+            "alice",
+            key,
+            action,
+            RequestBinding {
+                plan_id: uuid::Uuid::new_v4().to_string(),
+                source_fingerprint: preview.fingerprint,
+            },
+        )
+        .unwrap()
+        .job
+}
+
+#[test]
+fn artifact_expiry_preserves_original_receipt_retries_and_reclaims_only_reviewed_archive() {
+    use sambafied_shadow::{Action, JobStatus};
+    let lab = artifact_lab();
+    let store = lab.open();
+    store.write_file("SAVE.DAT", b"private", "alice").unwrap();
+    store.delete("BASE.DAT", "alice").unwrap();
+    let expired = export_job(&store, "original-export");
+    let later = export_job(&store, "later-export");
+    age_artifact(&store, &expired.id, 1);
+    age_artifact(&store, &later.id, 2);
+    let original = store.job(&expired.id, "alice").unwrap();
+    let before = store.inspect().unwrap();
+    let raw = bytes(store.namespace());
+    let action = Action::ExpireArtifacts { expired_before: 1 };
+    let plan = store
+        .preview_planned_action(before.revision, "alice", action.clone())
+        .unwrap();
+    let candidates = plan.retention.unwrap();
+    assert_eq!(candidates.artifacts, vec![expired.id.clone()]);
+    assert!(candidates.snapshots.is_empty() && candidates.trash.is_empty());
+    assert_eq!(bytes(store.namespace()), raw);
+    let accepted = submit_artifact_expiry(&store, 1, "cleanup");
+    assert_eq!(store.inspect().unwrap().schema, 7);
+    assert!(matches!(
+        store.submit_job(before.revision, "alice", "competitor", Action::Snapshot),
+        Err(Error::Busy)
+    ));
+    let request = accepted.request_binding.clone().unwrap();
+    drop(store);
+    let store = lab.open();
+    let completed = store
+        .execute_job(&accepted.id, "alice", |_| Ok(()))
+        .unwrap();
+    assert_eq!(completed.status, JobStatus::Succeeded);
+    let receipt = completed
+        .result
+        .as_ref()
+        .unwrap()
+        .retention
+        .as_ref()
+        .unwrap();
+    assert_eq!(receipt.artifacts, vec![expired.id.clone()]);
+    assert_eq!(receipt.reclaimed_bytes, 0);
+    assert!(receipt.physical_reclamation_deferred);
+    let after = store.inspect().unwrap();
+    assert_eq!(after.generation, before.generation);
+    assert_eq!(after.view, before.view);
+    assert!(after.artifacts[&expired.id].retirement.is_some());
+    assert!(after.artifacts[&later.id].retirement.is_none());
+    assert_eq!(after.revision, before.revision + 2);
+    assert!(
+        after.history[before.history.len()..]
+            .iter()
+            .all(|e| e.job_id.as_ref() == Some(&accepted.id))
+    );
+    assert_eq!(
+        after.history[before.history.len()].operation,
+        "expire-artifact"
+    );
+    assert!(matches!(
+        store.artifact(&expired.id, "alice"),
+        Err(Error::NotFound)
+    ));
+    assert!(
+        !store
+            .namespace()
+            .join("artifacts")
+            .join(format!("{}.tar", expired.id))
+            .exists()
+    );
+    assert!(
+        store
+            .namespace()
+            .join("artifacts")
+            .join(format!("{}.tar", later.id))
+            .exists()
+    );
+    let usage = store.storage_usage().unwrap();
+    assert_eq!(usage.retired_artifact_count, 1);
+    assert_eq!(usage.retired_artifact_physical_count, 0);
+    assert_eq!(usage.artifact_missing_count, 0);
+    assert_eq!(
+        usage.artifact_physical_bytes,
+        before.artifacts[&later.id].bytes
+    );
+    let manifest = bytes(store.namespace());
+    assert_eq!(store.job(&expired.id, "alice").unwrap(), original);
+    assert_eq!(
+        store
+            .submit_job(
+                original.expected_revision,
+                "alice",
+                "original-export",
+                Action::Export
+            )
+            .unwrap()
+            .job,
+        original
+    );
+    assert_eq!(
+        store
+            .planned_submission(
+                before.revision,
+                "alice",
+                "cleanup",
+                &action,
+                &request.plan_id
+            )
+            .unwrap(),
+        Some(completed.clone())
+    );
+    assert_eq!(
+        store
+            .execute_job(&completed.id, "alice", |_| Ok(()))
+            .unwrap(),
+        completed
+    );
+    assert_eq!(bytes(store.namespace()), manifest);
+    assert_eq!(
+        fs::read(lab.config.base.join("BASE.DAT")).unwrap(),
+        b"immutable"
+    );
+    assert_eq!(store.read("SAVE.DAT").unwrap(), b"private");
+    assert!(matches!(store.read("BASE.DAT"), Err(Error::NotFound)));
+    // A schema-7 store can still execute snapshot/trash expiry; normalizing its
+    // fingerprint must never downgrade it to schema 6.
+    let rev = after.revision;
+    let old_action = Action::ExpireRetained { expired_before: 0 };
+    let old_plan = store
+        .preview_planned_action(rev, "alice", old_action.clone())
+        .unwrap();
+    let old_job = store
+        .submit_planned_job(
+            rev,
+            "alice",
+            "older-expiry",
+            old_action,
+            sambafied_shadow::RequestBinding {
+                plan_id: uuid::Uuid::new_v4().to_string(),
+                source_fingerprint: old_plan.fingerprint,
+            },
+        )
+        .unwrap()
+        .job;
+    assert_eq!(store.inspect().unwrap().schema, 7);
+    assert_eq!(
+        store
+            .execute_job(&old_job.id, "alice", |_| Ok(()))
+            .unwrap()
+            .status,
+        JobStatus::Succeeded
+    );
+}
+
+#[test]
+fn artifact_expiry_denial_and_stale_execution_preserve_export_payload_and_receipt() {
+    use sambafied_shadow::JobStatus;
+    for denied in [true, false] {
+        let lab = artifact_lab();
+        let store = lab.open();
+        let export = export_job(&store, "export");
+        age_artifact(&store, &export.id, 1);
+        let accepted = submit_artifact_expiry(&store, 1, "expiry");
+        let path = store
+            .namespace()
+            .join("artifacts")
+            .join(format!("{}.tar", export.id));
+        let payload = fs::read(&path).unwrap();
+        if !denied {
+            store.write_file("NEW.DAT", b"concurrent", "alice").unwrap();
+        }
+        let before = store.inspect().unwrap();
+        let completed = store
+            .execute_job(&accepted.id, "alice", |_| {
+                if denied { Err(Error::Denied) } else { Ok(()) }
+            })
+            .unwrap();
+        assert_eq!(completed.status, JobStatus::Failed);
+        assert!(
+            store.inspect().unwrap().artifacts[&export.id]
+                .retirement
+                .is_none()
+        );
+        assert_eq!(fs::read(&path).unwrap(), payload);
+        assert_eq!(store.inspect().unwrap().revision, before.revision);
+        assert_eq!(
+            store.job(&export.id, "alice").unwrap().status,
+            JobStatus::Succeeded
+        );
+    }
+}
+
+#[test]
+fn artifact_collection_preserves_corrupt_payload_and_unrelated_orphan_as_charged_evidence() {
+    let lab = artifact_lab();
+    let store = lab.open();
+    let export = export_job(&store, "export");
+    age_artifact(&store, &export.id, 1);
+    let path = store
+        .namespace()
+        .join("artifacts")
+        .join(format!("{}.tar", export.id));
+    fs::write(&path, b"corrupt evidence").unwrap();
+    let orphan = store
+        .namespace()
+        .join("artifacts")
+        .join(format!("{}.tar", uuid::Uuid::new_v4()));
+    fs::write(&orphan, b"orphan evidence").unwrap();
+    let accepted = submit_artifact_expiry(&store, 1, "expiry");
+    let completed = store
+        .execute_job(&accepted.id, "alice", |_| Ok(()))
+        .unwrap();
+    assert_eq!(completed.status, sambafied_shadow::JobStatus::Succeeded);
+    let usage = store.storage_usage().unwrap();
+    assert_eq!(usage.retired_artifact_physical_count, 1);
+    assert_eq!(usage.artifact_orphan_count, 1);
+    assert_eq!(usage.retired_artifact_physical_bytes, 16);
+    assert_eq!(usage.retained_charged_bytes, 31);
+    assert_eq!(fs::read(&path).unwrap(), b"corrupt evidence");
+    assert_eq!(fs::read(&orphan).unwrap(), b"orphan evidence");
+    drop(store);
+    let reopened = lab.open();
+    assert_eq!(reopened.storage_usage().unwrap(), usage);
+    assert_eq!(reopened.job(&completed.id, "alice").unwrap(), completed);
+}
+
+#[cfg(windows)]
+#[test]
+fn committed_artifact_retirement_survives_delete_denial_without_duplicate_audit() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let lab = artifact_lab();
+    let store = lab.open();
+    let export = export_job(&store, "export");
+    age_artifact(&store, &export.id, 1);
+    let path = store
+        .namespace()
+        .join("artifacts")
+        .join(format!("{}.tar", export.id));
+    let blocker = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(3)
+        .open(&path)
+        .unwrap();
+    let accepted = submit_artifact_expiry(&store, 1, "expiry");
+    let completed = store
+        .execute_job(&accepted.id, "alice", |_| Ok(()))
+        .unwrap();
+    assert_eq!(completed.status, sambafied_shadow::JobStatus::Succeeded);
+    let usage = store.storage_usage().unwrap();
+    assert_eq!(usage.retired_artifact_physical_count, 1);
+    assert_eq!(
+        usage.retained_charged_bytes,
+        store.inspect().unwrap().artifacts[&export.id].bytes
+    );
+    let committed = bytes(store.namespace());
+    drop(blocker);
+    drop(store);
+    let reopened = lab.open();
+    assert!(!path.exists());
+    assert_eq!(
+        reopened
+            .storage_usage()
+            .unwrap()
+            .retired_artifact_physical_count,
+        0
+    );
+    assert_eq!(reopened.storage_usage().unwrap().retained_charged_bytes, 0);
+    assert_eq!(bytes(reopened.namespace()), committed);
+    assert_eq!(
+        reopened
+            .execute_job(&completed.id, "alice", |_| Ok(()))
+            .unwrap(),
+        completed
+    );
+}
+
+#[test]
+fn artifact_retirement_releases_count_capacity_without_forgetting_export_or_cleanup_jobs() {
+    let mut lab = artifact_lab();
+    lab.config.policy.artifacts.as_mut().unwrap().count_limit = 1;
+    let store = lab.open();
+    let old = export_job(&store, "old-export");
+    age_artifact(&store, &old.id, 1);
+    assert!(matches!(
+        store.preview_planned_action(
+            store.inspect().unwrap().revision,
+            "alice",
+            sambafied_shadow::Action::Export
+        ),
+        Err(Error::Quota)
+    ));
+    let accepted = submit_artifact_expiry(&store, 1, "cleanup");
+    let cleanup = store
+        .execute_job(&accepted.id, "alice", |_| Ok(()))
+        .unwrap();
+    let fresh = export_job(&store, "new-export");
+    assert_ne!(fresh.id, old.id);
+    assert_eq!(store.inspect().unwrap().artifacts.len(), 2);
+    assert!(store.artifact(&fresh.id, "alice").is_ok());
+    assert!(matches!(
+        store.artifact(&old.id, "alice"),
+        Err(Error::NotFound)
+    ));
+    assert_eq!(store.job(&cleanup.id, "alice").unwrap(), cleanup);
+    let old_receipt = store.job(&old.id, "alice").unwrap();
+    assert_eq!(
+        store
+            .submit_job(
+                old_receipt.expected_revision,
+                "alice",
+                "old-export",
+                sambafied_shadow::Action::Export
+            )
+            .unwrap()
+            .job,
+        old_receipt
+    );
+}
+
+#[test]
+fn artifact_retirement_requires_whole_audit_batch_and_valid_schema_job_linkage() {
+    let lab = artifact_lab();
+    let store = lab.open();
+    let export = export_job(&store, "export");
+    age_artifact(&store, &export.id, 1);
+    let accepted = submit_artifact_expiry(&store, 1, "expiry");
+    let completed = store
+        .execute_job(&accepted.id, "alice", |_| Ok(()))
+        .unwrap();
+    let raw = bytes(store.namespace());
+    for corruption in 0..4 {
+        rewrite(&store, |state| match corruption {
+            0 => state.schema = 6,
+            1 => {
+                state
+                    .artifacts
+                    .get_mut(&export.id)
+                    .unwrap()
+                    .retirement
+                    .as_mut()
+                    .unwrap()
+                    .job_id = uuid::Uuid::new_v4().to_string()
+            }
+            2 => state
+                .jobs
+                .get_mut(&completed.id)
+                .unwrap()
+                .result
+                .as_mut()
+                .unwrap()
+                .retention
+                .as_mut()
+                .unwrap()
+                .artifacts
+                .clear(),
+            _ => {
+                state
+                    .artifacts
+                    .get_mut(&export.id)
+                    .unwrap()
+                    .retirement
+                    .as_mut()
+                    .unwrap()
+                    .expired_before = 0
+            }
+        });
+        assert!(matches!(store.inspect(), Err(Error::Corrupt)));
+        fs::write(store.namespace().join("state.json"), &raw).unwrap();
+    }
+    let mut full_lab = artifact_lab();
+    full_lab.config.policy.history_limit = 2;
+    let full = full_lab.open();
+    let export = export_job(&full, "full-export");
+    age_artifact(&full, &export.id, 1);
+    let before = bytes(full.namespace());
+    assert!(matches!(
+        full.preview_planned_action(
+            full.inspect().unwrap().revision,
+            "alice",
+            sambafied_shadow::Action::ExpireArtifacts { expired_before: 1 }
+        ),
+        Err(Error::Quota)
+    ));
+    assert_eq!(bytes(full.namespace()), before);
+    assert!(
+        full.namespace()
+            .join("artifacts")
+            .join(format!("{}.tar", export.id))
+            .exists()
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn artifact_expiry_failed_publication_never_deletes_archive_or_retires_metadata() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let lab = artifact_lab();
+    let store = lab.open();
+    let export = export_job(&store, "export");
+    age_artifact(&store, &export.id, 1);
+    let accepted = submit_artifact_expiry(&store, 1, "expiry");
+    let before = bytes(store.namespace());
+    let path = store
+        .namespace()
+        .join("artifacts")
+        .join(format!("{}.tar", export.id));
+    let archive = fs::read(&path).unwrap();
+    let blocker = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(3)
+        .open(store.namespace().join("state.json"))
+        .unwrap();
+    assert!(matches!(
+        store.execute_job(&accepted.id, "alice", |_| Ok(())),
+        Err(Error::Io(_))
+    ));
+    assert_eq!(bytes(store.namespace()), before);
+    assert_eq!(fs::read(&path).unwrap(), archive);
+    assert!(
+        store.inspect().unwrap().artifacts[&export.id]
+            .retirement
+            .is_none()
+    );
+    drop(blocker);
+    assert_eq!(
+        store
+            .execute_job(&accepted.id, "alice", |_| Ok(()))
+            .unwrap()
+            .status,
+        sambafied_shadow::JobStatus::Succeeded
+    );
+    assert!(!path.exists());
+}

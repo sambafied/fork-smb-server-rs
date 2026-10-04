@@ -50,9 +50,19 @@ impl Store {
         job: Option<&str>,
     ) -> Result<String> {
         let mut normalized;
-        let state = if matches!(action, Action::ExpireRetained { .. }) {
+        let state = if matches!(
+            action,
+            Action::ExpireRetained { .. } | Action::ExpireArtifacts { .. }
+        ) {
             normalized = state.clone();
-            normalized.schema = 6;
+            normalized.schema =
+                normalized
+                    .schema
+                    .max(if matches!(action, Action::ExpireArtifacts { .. }) {
+                        7
+                    } else {
+                        6
+                    });
             &normalized
         } else {
             state

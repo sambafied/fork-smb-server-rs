@@ -7,7 +7,7 @@
 #![forbid(unsafe_code)]
 
 mod artifacts;
-pub use artifacts::{ArtifactPolicy, ExportArtifact};
+pub use artifacts::{ArtifactPolicy, ArtifactRetirement, ExportArtifact};
 
 mod backup_jobs;
 mod export;
@@ -21,7 +21,9 @@ pub use policy_catalog::{
     PolicyAuditBatch, PolicyChange, PolicyCheckpoint, PolicyDocument, PolicyRead,
     SharePolicyCatalog,
 };
-pub use retention::{ExpiryPreview, ExpiryResult, RetentionJobResult, StorageUsage};
+pub use retention::{
+    ExpiryPreview, ExpiryResult, RetentionJobResult, StorageObservation, StorageUsage,
+};
 
 use atomic_write_file::AtomicWriteFile;
 use serde::{Deserialize, Serialize};
@@ -491,6 +493,7 @@ impl Store {
                 store.save(&state)?;
             }
             store.collect_blobs(&state)?;
+            let _ = store.collect_retired_artifacts(&state);
         } else {
             store.save(&State {
                 schema: 5,
@@ -554,26 +557,69 @@ impl Store {
     fn load(&self) -> Result<State> {
         let state: State =
             serde_json::from_slice(&bounded_read(&self.state_path(), 16 * 1024 * 1024)?)?;
-        if !matches!(state.schema, 1..=6)
+        if !matches!(state.schema, 1..=7)
             || (state.schema == 1 && !state.jobs.is_empty())
             || state.jobs.values().any(|job| {
-                (state.schema < 6
-                    && (matches!(job.action, Action::ExpireRetained { .. })
+                (state.schema < 7
+                    && (matches!(job.action, Action::ExpireArtifacts { .. })
                         || job
+                            .result
+                            .as_ref()
+                            .and_then(|r| r.retention.as_ref())
+                            .is_some_and(|r| !r.artifacts.is_empty())))
+                    || (state.schema < 6
+                        && (matches!(
+                            job.action,
+                            Action::ExpireRetained { .. } | Action::ExpireArtifacts { .. }
+                        ) || job
                             .result
                             .as_ref()
                             .is_some_and(|result| result.retention.is_some())))
                     || (job.status == JobStatus::Succeeded
-                        && matches!(job.action, Action::ExpireRetained { .. })
+                        && matches!(
+                            job.action,
+                            Action::ExpireRetained { .. } | Action::ExpireArtifacts { .. }
+                        )
                         && job
                             .result
                             .as_ref()
                             .is_none_or(|result| result.retention.is_none()))
-                    || (!matches!(job.action, Action::ExpireRetained { .. })
-                        && job
-                            .result
-                            .as_ref()
-                            .is_some_and(|result| result.retention.is_some()))
+                    || (!matches!(
+                        job.action,
+                        Action::ExpireRetained { .. } | Action::ExpireArtifacts { .. }
+                    ) && job
+                        .result
+                        .as_ref()
+                        .is_some_and(|result| result.retention.is_some()))
+                    || job
+                        .result
+                        .as_ref()
+                        .and_then(|r| r.retention.as_ref())
+                        .is_some_and(|receipt| {
+                            if job.status != JobStatus::Succeeded || receipt.reclaimed_bytes != 0 {
+                                return true;
+                            }
+                            match &job.action {
+                                Action::ExpireArtifacts { expired_before } => {
+                                    !receipt.snapshots.is_empty()
+                                        || !receipt.trash.is_empty()
+                                        || receipt.expired_before != *expired_before
+                                        || receipt.artifacts.windows(2).any(|ids| ids[0] >= ids[1])
+                                        || receipt.artifacts.iter().any(|id| {
+                                            state
+                                                .artifacts
+                                                .get(id)
+                                                .and_then(|a| a.retirement.as_ref())
+                                                .is_none_or(|retired| retired.job_id != job.id)
+                                        })
+                                }
+                                Action::ExpireRetained { expired_before } => {
+                                    !receipt.artifacts.is_empty()
+                                        || receipt.expired_before != *expired_before
+                                }
+                                _ => true,
+                            }
+                        })
                     || (state.schema < 5
                         && (job.action == Action::Export
                             || job.result.as_ref().is_some_and(|r| r.artifact_id.is_some())))
@@ -609,6 +655,7 @@ impl Store {
         // Reclamation failure leaves extra blobs; physical admission limits
         // prevent unbounded growth without misreporting a committed activation.
         let _ = self.collect_blobs(state);
+        let _ = self.collect_retired_artifacts(state);
         Ok(())
     }
 
@@ -660,6 +707,24 @@ impl Store {
             operation.store.load()?,
             operation.store.config.policy.clone(),
             operation.store.policy_revision,
+        ))
+    }
+    /// Inspect one coherent policy, manifest and physical payload observation.
+    /// Physical payload lengths exclude metadata, allocation overhead and backups.
+    pub fn inspect_with_policy_and_usage(
+        &self,
+    ) -> Result<(State, Policy, Option<u64>, StorageObservation)> {
+        let _lease = self.lease()?;
+        let operation = self.serial()?;
+        let current = &operation.store;
+        let state = current.load()?;
+        let observed_at = now();
+        let usage = current.storage_usage_locked(&state, observed_at)?;
+        Ok((
+            state,
+            current.config.policy.clone(),
+            current.policy_revision,
+            StorageObservation { observed_at, usage },
         ))
     }
     fn lookup<'a>(&'a self, view: &'a View, path: &str) -> Option<&'a Entry> {
