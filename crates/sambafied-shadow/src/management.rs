@@ -8,6 +8,12 @@ const JOB_LIMIT: usize = 1024;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "action", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum Action {
+    ExpireArtifacts {
+        expired_before: u64,
+    },
+    ExpireRetained {
+        expired_before: u64,
+    },
     Snapshot,
     Export,
     Reset,
@@ -48,6 +54,8 @@ pub enum JobStatus {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct JobResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention: Option<RetentionJobResult>,
     pub revision: u64,
     pub generation: String,
     pub snapshot_id: Option<String>,
@@ -112,6 +120,8 @@ pub struct Submission {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ActionImpact {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention: Option<ExpiryPreview>,
     pub revision: u64,
     pub generation: String,
     pub base_version: String,
@@ -128,7 +138,16 @@ pub struct ActionImpact {
 }
 
 impl Action {
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
+        if let Self::ExpireRetained { expired_before } | Self::ExpireArtifacts { expired_before } =
+            self
+        {
+            return if *expired_before <= now() {
+                Ok(())
+            } else {
+                Err(Error::Path)
+            };
+        }
         match self {
             Self::Backup { destination_id }
             | Self::RestoreBackup { destination_id, .. }
@@ -140,7 +159,12 @@ impl Action {
             _ => {}
         }
         let source = match self {
-            Self::Snapshot | Self::Export | Self::Reset | Self::Backup { .. } => return Ok(()),
+            Self::Snapshot
+            | Self::Export
+            | Self::Reset
+            | Self::Backup { .. }
+            | Self::ExpireRetained { .. }
+            | Self::ExpireArtifacts { .. } => return Ok(()),
             Self::Rollback { snapshot_id } | Self::DeleteSnapshot { snapshot_id } => snapshot_id,
             Self::RestoreTrash { trash_id } | Self::PurgeTrash { trash_id } => trash_id,
             Self::RestoreBackup { backup_id, .. } | Self::DeleteBackup { backup_id, .. } => {
@@ -202,7 +226,22 @@ impl Store {
         current.revision(&original, expected)?;
         let fingerprint = current.action_fingerprint(&original, catalog, &action, None)?;
         let mut staged = original.clone();
+        let mut retention = None;
         match &action {
+            Action::ExpireArtifacts { expired_before } => {
+                retention = Some(current.retire_artifacts_locked(
+                    &mut staged,
+                    actor,
+                    *expired_before,
+                    None,
+                )?);
+                current.event(&mut staged, actor, "expire-artifacts", None, None)?;
+            }
+            Action::ExpireRetained { expired_before } => {
+                retention =
+                    Some(current.expire_locked(&mut staged, actor, *expired_before, None)?);
+                current.event(&mut staged, actor, "expire-retained", None, None)?;
+            }
             Action::Export => {
                 let capture = current.prepare_artifact(&staged, &id(), actor, now())?;
                 staged
@@ -309,6 +348,7 @@ impl Store {
         let retained_bytes_after =
             retained_bytes_after + current.artifact_usage(&staged)?.values().sum::<u64>();
         Ok(ActionImpact {
+            retention,
             revision: original.revision,
             generation: original.generation,
             base_version: original.identity.base_version,
@@ -322,6 +362,8 @@ impl Store {
             physical_reclamation_deferred: matches!(
                 action,
                 Action::PurgeTrash { .. }
+                    | Action::ExpireRetained { .. }
+                    | Action::ExpireArtifacts { .. }
                     | Action::DeleteSnapshot { .. }
                     | Action::DeleteBackup { .. }
             ),
@@ -394,8 +436,8 @@ impl Store {
         let current = &_serial.store;
         let mut state = current.load()?;
         let key_digest = digest(key.as_bytes());
-        if let Some(job) = state
-            .jobs
+        let jobs = current.receipt_jobs(&state)?;
+        if let Some(job) = jobs
             .values()
             .find(|j| j.actor == actor && j.key_digest == key_digest)
         {
@@ -411,6 +453,14 @@ impl Store {
             });
         }
         current.revision(&state, expected)?;
+        if state.jobs.values().any(|job| {
+            matches!(
+                job.action,
+                Action::ExpireRetained { .. } | Action::ExpireArtifacts { .. }
+            ) && matches!(job.status, JobStatus::Queued | JobStatus::Running)
+        }) {
+            return Err(Error::Busy);
+        }
         if let Some(binding) = &binding
             && current.action_fingerprint(&state, catalog, &action, None)?
                 != binding.source_fingerprint
@@ -421,6 +471,24 @@ impl Store {
             return Err(Error::Quota);
         }
         let at = now();
+        if matches!(
+            action,
+            Action::ExpireRetained { .. } | Action::ExpireArtifacts { .. }
+        ) {
+            // Reject concurrent accepted work before creating another durable job.
+            if state
+                .jobs
+                .values()
+                .any(|job| matches!(job.status, JobStatus::Queued | JobStatus::Running))
+            {
+                return Err(Error::Busy);
+            }
+            state.schema = if matches!(action, Action::ExpireArtifacts { .. }) {
+                state.schema.max(7)
+            } else {
+                state.schema.max(6)
+            };
+        }
         let job = Job {
             id: id(),
             actor: actor.into(),
@@ -467,8 +535,8 @@ impl Store {
         let current = &_serial.store;
         let state = current.load()?;
         let key_digest = digest(key.as_bytes());
-        let Some(job) = state
-            .jobs
+        let jobs = current.receipt_jobs(&state)?;
+        let Some(job) = jobs
             .values()
             .find(|job| job.actor == actor && job.key_digest == key_digest)
         else {
@@ -492,9 +560,9 @@ impl Store {
         let _lease = self.lease()?;
         let _serial = self.serial()?;
         let current = &_serial.store;
+        let state = current.load()?;
         current
-            .load()?
-            .jobs
+            .receipt_jobs(&state)?
             .get(job_id)
             .filter(|j| j.actor == actor)
             .cloned()
@@ -525,8 +593,8 @@ impl Store {
         let _serial = self.serial()?;
         let current = &_serial.store;
         let mut original = current.load()?;
-        let mut job = original
-            .jobs
+        let mut job = current
+            .receipt_jobs(&original)?
             .get(job_id)
             .filter(|j| j.actor == actor)
             .cloned()
@@ -564,6 +632,7 @@ impl Store {
             let mut staged = original.clone();
             let history_start = staged.history.len();
             let mut result = JobResult {
+                retention: None,
                 revision: staged.revision,
                 generation: staged.generation.clone(),
                 snapshot_id: None,
@@ -575,6 +644,60 @@ impl Store {
             let mut deletion = None;
             let mut export = None;
             match &job.action {
+                Action::ExpireArtifacts { expired_before } => {
+                    let retired = current.retire_artifacts_locked(
+                        &mut staged,
+                        actor,
+                        *expired_before,
+                        Some(job_id),
+                    )?;
+                    let usage = current.storage_usage_locked(&staged, now())?;
+                    result.retention = Some(RetentionJobResult {
+                        artifacts: retired.artifacts,
+                        expired_before: *expired_before,
+                        snapshots: vec![],
+                        trash: vec![],
+                        retained_bytes_after: usage.retained_charged_bytes,
+                        reclaimed_bytes: 0,
+                        deferred_blob_bytes: usage.blob_unreferenced_bytes,
+                        physical_reclamation_deferred: usage.retired_artifact_physical_count > 0
+                            || usage.artifact_orphan_count > 0,
+                    });
+                    current.event(
+                        &mut staged,
+                        actor,
+                        "expire-artifacts",
+                        None,
+                        Some(job.id.clone()),
+                    )?;
+                }
+                Action::ExpireRetained { expired_before } => {
+                    let expired =
+                        current.expire_locked(&mut staged, actor, *expired_before, Some(job_id))?;
+                    let usage = current.storage_usage_locked(&staged, now())?;
+                    result.retention = Some(RetentionJobResult {
+                        artifacts: vec![],
+                        expired_before: *expired_before,
+                        snapshots: expired.snapshots,
+                        trash: expired.trash,
+                        retained_bytes_after: usage.retained_charged_bytes,
+                        reclaimed_bytes: 0,
+                        deferred_blob_bytes: usage.blob_unreferenced_bytes,
+                        physical_reclamation_deferred: usage.blob_unreferenced_count > 0
+                            || usage.artifact_orphan_count > 0
+                            || usage.expired_artifact_count > 0
+                            || usage.expired_snapshot_count > 0
+                            || usage.expired_trash_count > 0,
+                    });
+                    // Even an empty sweep has one committed completion event.
+                    current.event(
+                        &mut staged,
+                        actor,
+                        "expire-retained",
+                        None,
+                        Some(job.id.clone()),
+                    )?;
+                }
                 Action::Export => {
                     let capture =
                         current.prepare_artifact(&staged, &job.id, actor, job.created_at)?;

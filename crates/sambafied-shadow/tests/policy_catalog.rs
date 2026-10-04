@@ -20,6 +20,56 @@ fn policy() -> Policy {
 }
 
 #[test]
+fn full_durable_audit_outbox_rejects_replacement_without_truncation() {
+    let temp = tempfile::tempdir().unwrap();
+    let catalog = SharePolicyCatalog::open(temp.path(), "org", "games", policy()).unwrap();
+    let mut document = catalog.replace(0, "verified-actor", policy()).unwrap();
+    // A coherent, full durable fixture exercises admission at the bound without
+    // claiming 1024 independently observed production administrative commits.
+    let event = document.changes[0].clone();
+    document.changes = (1..=1024)
+        .map(|revision| {
+            let mut change = event.clone();
+            change.revision = revision;
+            change
+        })
+        .collect();
+    document.revision = 1024;
+    let path = fs::read_dir(temp.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "json")
+        })
+        .unwrap();
+    fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
+    assert_eq!(catalog.read().unwrap().document().changes.len(), 1024);
+    let before = tree(temp.path());
+    assert!(matches!(
+        catalog.replace(1024, "verified-actor", policy()),
+        Err(Error::Quota)
+    ));
+    assert_eq!(tree(temp.path()), before);
+    let read = catalog.read().unwrap();
+    let batch = read.audit_batch().unwrap();
+    let tag = read.fingerprint().unwrap();
+    drop(read);
+    catalog
+        .acknowledge(&batch.fingerprint().unwrap(), 1024, "archive-operator")
+        .unwrap();
+    let read = catalog.read().unwrap();
+    assert_eq!(read.fingerprint().unwrap(), tag);
+    assert!(read.document().changes.is_empty());
+    assert_eq!(read.document().checkpoint.as_ref().unwrap().revision, 1024);
+    drop(read);
+    assert_eq!(
+        catalog.replace(1024, "actor", policy()).unwrap().revision,
+        1025
+    );
+}
+
+#[test]
 fn durable_replace_preserves_scope_and_ignores_startup_defaults_after_reopen() {
     let temp = tempfile::tempdir().unwrap();
     let catalog = SharePolicyCatalog::open(temp.path(), "org", "games", policy()).unwrap();
@@ -122,7 +172,7 @@ fn unknown_format_scope_or_broken_audit_chain_fails_closed() {
     for field in ["schema", "organization", "revision", "policy", "changes"] {
         let mut value: serde_json::Value = serde_json::from_slice(&initial).unwrap();
         match field {
-            "schema" => value[field] = 2.into(),
+            "schema" => value[field] = 3.into(),
             "organization" => value[field] = "wrong".into(),
             "revision" => value[field] = 0.into(),
             "policy" => value[field]["active_bytes"] = 1.into(),
@@ -395,4 +445,112 @@ fn export_holds_one_policy_until_the_last_archive_write() {
     assert_eq!(catalog.read().unwrap().document().revision, 0);
     catalog.replace(0, "operator", policy()).unwrap();
     assert_eq!(store.inspect().unwrap().revision, state.revision);
+}
+
+#[test]
+fn audit_acknowledgement_is_exact_busy_safe_and_preserves_policy_identity() {
+    let temp = tempfile::tempdir().unwrap();
+    let catalog = SharePolicyCatalog::open(temp.path(), "org", "games", policy()).unwrap();
+    catalog.replace(0, "actor", policy()).unwrap();
+    let read = catalog.read().unwrap();
+    let exported = read.audit_batch().unwrap();
+    let digest = exported.fingerprint().unwrap();
+    let policy_tag = read.fingerprint().unwrap();
+    let before = tree(temp.path());
+    assert!(matches!(
+        catalog.acknowledge(&digest, 1, "archive"),
+        Err(Error::Busy)
+    ));
+    assert_eq!(tree(temp.path()), before);
+    drop(read);
+    for (tag, revision, actor) in [
+        ("f".repeat(64), 1, "archive"),
+        (digest.clone(), 2, "archive"),
+        (digest.clone(), 1, "bad\nactor"),
+    ] {
+        assert!(catalog.acknowledge(&tag, revision, actor).is_err());
+        assert_eq!(tree(temp.path()), before);
+    }
+    catalog
+        .acknowledge(&digest, 1, "verified-archive-actor")
+        .unwrap();
+    let reopened = SharePolicyCatalog::open(temp.path(), "org", "games", policy()).unwrap();
+    let read = reopened.read().unwrap();
+    assert_eq!(read.fingerprint().unwrap(), policy_tag);
+    assert_eq!(read.document().revision, 1);
+    assert!(read.document().changes.is_empty());
+    let checkpoint = read.document().checkpoint.as_ref().unwrap();
+    assert_eq!(checkpoint.actor, "verified-archive-actor");
+    assert_eq!(checkpoint.batch_digest, digest);
+    let first_checkpoint = serde_json::to_vec(checkpoint).unwrap();
+    drop(read);
+    let before = tree(temp.path());
+    assert!(matches!(
+        catalog.acknowledge(&digest, 1, "archive"),
+        Err(Error::Revision)
+    ));
+    assert_eq!(tree(temp.path()), before);
+    reopened.replace(1, "actor", policy()).unwrap();
+    let read = reopened.read().unwrap();
+    let next = read.audit_batch().unwrap();
+    drop(read);
+    reopened
+        .acknowledge(&next.fingerprint().unwrap(), 2, "archive")
+        .unwrap();
+    use sha2::{Digest, Sha256};
+    assert_eq!(
+        reopened
+            .read()
+            .unwrap()
+            .document()
+            .checkpoint
+            .as_ref()
+            .unwrap()
+            .previous_checkpoint_digest,
+        Some(format!("{:x}", Sha256::digest(first_checkpoint)))
+    );
+}
+
+#[test]
+fn later_change_makes_export_stale_and_corrupt_checkpoint_fails_closed() {
+    let temp = tempfile::tempdir().unwrap();
+    let catalog = SharePolicyCatalog::open(temp.path(), "org", "games", policy()).unwrap();
+    catalog.replace(0, "actor", policy()).unwrap();
+    let exported = catalog.read().unwrap().audit_batch().unwrap();
+    catalog.replace(1, "actor", policy()).unwrap();
+    let before = tree(temp.path());
+    assert!(matches!(
+        catalog.acknowledge(&exported.fingerprint().unwrap(), 1, "archive"),
+        Err(Error::Revision)
+    ));
+    assert_eq!(tree(temp.path()), before);
+    let exported = catalog.read().unwrap().audit_batch().unwrap();
+    catalog
+        .acknowledge(&exported.fingerprint().unwrap(), 2, "archive")
+        .unwrap();
+    let path = fs::read_dir(temp.path())
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.extension().is_some_and(|e| e == "json"))
+        .unwrap();
+    let initial = fs::read(&path).unwrap();
+    for field in [
+        "revision",
+        "policy_digest",
+        "batch_digest",
+        "actor",
+        "previous_checkpoint_digest",
+    ] {
+        let mut value: serde_json::Value = serde_json::from_slice(&initial).unwrap();
+        value["checkpoint"][field] = match field {
+            "revision" => 0.into(),
+            "actor" => "bad\nactor".into(),
+            "policy_digest" => "f".repeat(64).into(),
+            _ => "invalid".into(),
+        };
+        fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(catalog.read().is_err());
+        assert!(SharePolicyCatalog::open(temp.path(), "org", "games", policy()).is_err());
+    }
+    fs::write(path, initial).unwrap();
 }

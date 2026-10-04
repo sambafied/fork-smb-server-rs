@@ -159,6 +159,28 @@ fn inner(open: &OpenFile) -> VfsResult<&Inner> {
 fn registry_lock(registry: &Mutex<Registry>) -> VfsResult<std::sync::MutexGuard<'_, Registry>> {
     registry.lock().map_err(|_| VfsError::AccessDenied)
 }
+fn parents_not_pending(
+    store: &Store,
+    registry: &Registry,
+    prefix: &str,
+    path: &str,
+) -> VfsResult<()> {
+    let mut parent = path;
+    while let Some((ancestor, _)) = parent.rsplit_once('/') {
+        let entry = store.stat(ancestor).map_err(error)?;
+        let key = format!("{prefix}{}", entry.object_id);
+        if registry.pending.contains(&key)
+            || registry
+                .intents
+                .get(&key)
+                .is_some_and(|intents| !intents.is_empty())
+        {
+            return Err(VfsError::AccessDenied);
+        }
+        parent = ancestor;
+    }
+    Ok(())
+}
 
 impl ShadowVfs {
     /// Validate and open a server-owned namespace during startup.
@@ -278,6 +300,7 @@ impl Vfs for ShadowVfs {
         let (guard, metadata, action) = self
             .run(move |store, actor| {
                 let mut registry = registry_lock(&registry)?;
+                parents_not_pending(&store, &registry, &prefix, &path)?;
                 let directory = match store.stat(&path) {
                     Ok(existing) => {
                         let key = format!("{prefix}{}", existing.object_id);
@@ -307,6 +330,9 @@ impl Vfs for ShadowVfs {
                     )
                     .map_err(error)?;
                 let handle = Arc::new(handle);
+                if options & DELETE_ON_CLOSE != 0 {
+                    store.check_delete_handle(&handle).map_err(error)?;
+                }
                 let key = format!("{prefix}{}", handle.object_id);
                 let handles = registry.handles.entry(key.clone()).or_default();
                 handles.retain(|weak| weak.strong_count() > 0);
@@ -425,9 +451,15 @@ impl Vfs for ShadowVfs {
         self.run(move |_, _| cleanup.run()).await
     }
     async fn mkdir(&self, rel: &str) -> VfsResult<()> {
-        let rel = rel.to_string();
-        self.run(move |store, actor| store.mkdir(&rel, &actor).map_err(error))
-            .await
+        let rel = sambafied_shadow::normalize(rel).map_err(error)?;
+        let registry = self.registry.clone();
+        let prefix = self.key_prefix.clone();
+        self.run(move |store, actor| {
+            let registry = registry_lock(&registry)?;
+            parents_not_pending(&store, &registry, &prefix, &rel)?;
+            store.mkdir(&rel, &actor).map_err(error)
+        })
+        .await
     }
     async fn rmdir(&self, rel: &str) -> VfsResult<()> {
         let rel = rel.to_string();
@@ -509,8 +541,12 @@ impl Vfs for ShadowVfs {
                 let cleanup = inner(open)?.cleanup.clone();
                 let deleting = *delete || open.delete_on_close;
                 self.run(move |store, _| {
-                    store.stat_handle(&cleanup.handle).map_err(error)?;
                     let mut registry = registry_lock(&cleanup.registry)?;
+                    if deleting {
+                        store.check_delete_handle(&cleanup.handle).map_err(error)?;
+                    } else {
+                        store.stat_handle(&cleanup.handle).map_err(error)?;
+                    }
                     let pointer = Arc::as_ptr(&cleanup.handle) as usize;
                     if deleting {
                         registry
@@ -554,7 +590,16 @@ impl Vfs for ShadowVfs {
                 }
                 let target = name.clone();
                 let replace = *replace_if_exists;
+                let registry = self.registry.clone();
+                let prefix = self.key_prefix.clone();
                 self.run(move |store, actor| {
+                    let registry = registry_lock(&registry)?;
+                    parents_not_pending(
+                        &store,
+                        &registry,
+                        &prefix,
+                        &sambafied_shadow::normalize(&target).map_err(error)?,
+                    )?;
                     store
                         .rename_handle(&handle, &target, replace, &actor)
                         .map_err(error)

@@ -6,17 +6,33 @@
 //! counterpart. The lease works across the API and SMB engine processes.
 #![forbid(unsafe_code)]
 
+mod receipt_archive;
+pub use receipt_archive::{
+    ReceiptArchival, ReceiptArchiveBatch, ReceiptArchiveCheckpoint, ReceiptArchivePreview,
+    ReceiptArchiveReference,
+};
+
+mod history_audit;
+pub use history_audit::{HistoryAcknowledgement, HistoryAuditBatch, HistoryCheckpoint};
+
 mod artifacts;
-pub use artifacts::{ArtifactPolicy, ExportArtifact};
+pub use artifacts::{ArtifactPolicy, ArtifactRetirement, ExportArtifact};
 
 mod backup_jobs;
 mod export;
 mod management;
 mod policy_catalog;
+mod retention;
 pub use backup_jobs::BackupCatalog;
 pub use export::{ExportManifest, ExportPreflight, ExportSummary};
 pub use management::{Action, ActionImpact, Job, JobResult, JobStatus, RequestBinding, Submission};
-pub use policy_catalog::{PolicyChange, PolicyDocument, PolicyRead, SharePolicyCatalog};
+pub use policy_catalog::{
+    PolicyAuditBatch, PolicyChange, PolicyCheckpoint, PolicyDocument, PolicyRead,
+    SharePolicyCatalog,
+};
+pub use retention::{
+    ExpiryPreview, ExpiryResult, RetentionJobResult, StorageObservation, StorageUsage,
+};
 
 use atomic_write_file::AtomicWriteFile;
 use serde::{Deserialize, Serialize};
@@ -92,7 +108,8 @@ pub struct Policy {
 }
 
 impl Policy {
-    fn validate(&self) -> Result<()> {
+    /// Validate a full replacement before attempting publication.
+    pub fn validate(&self) -> Result<()> {
         if let Some(artifacts) = &self.artifacts {
             artifacts.validate(self.retained_bytes)?;
         }
@@ -182,6 +199,8 @@ pub struct Snapshot {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Trash {
     pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<String>,
     pub path: String,
     pub entry: Entry,
     pub from_upper: bool,
@@ -190,6 +209,7 @@ pub struct Trash {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Event {
     pub sequence: u64,
     pub revision: u64,
@@ -217,8 +237,12 @@ pub struct State {
     #[serde(default)]
     pub backups: BTreeMap<String, Backup>,
     pub history: Vec<Event>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_checkpoint: Option<HistoryCheckpoint>,
     #[serde(default)]
     pub jobs: BTreeMap<String, Job>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt_archive: Option<ReceiptArchiveReference>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub artifacts: BTreeMap<String, ExportArtifact>,
 }
@@ -485,6 +509,7 @@ impl Store {
                 store.save(&state)?;
             }
             store.collect_blobs(&state)?;
+            let _ = store.collect_retired_artifacts(&state);
         } else {
             store.save(&State {
                 schema: 5,
@@ -497,7 +522,9 @@ impl Store {
                 trash: BTreeMap::new(),
                 backups: BTreeMap::new(),
                 history: Vec::new(),
+                history_checkpoint: None,
                 jobs: BTreeMap::new(),
+                receipt_archive: None,
                 artifacts: BTreeMap::new(),
             })?;
         }
@@ -548,12 +575,96 @@ impl Store {
     fn load(&self) -> Result<State> {
         let state: State =
             serde_json::from_slice(&bounded_read(&self.state_path(), 16 * 1024 * 1024)?)?;
-        if !matches!(state.schema, 1..=5)
+        let jobs = self.receipt_jobs(&state)?;
+        if !matches!(state.schema, 1..=9)
             || (state.schema == 1 && !state.jobs.is_empty())
-            || state.jobs.values().any(|job| {
-                (state.schema < 5
-                    && (job.action == Action::Export
-                        || job.result.as_ref().is_some_and(|r| r.artifact_id.is_some())))
+            || jobs.iter().any(|(id, job)| {
+                Uuid::parse_str(id).map_or(true, |parsed| parsed.to_string() != *id)
+                    || job.id != *id
+                    || job.actor.is_empty()
+                    || job.actor.len() > 256
+                    || job.actor.chars().any(char::is_control)
+                    || job.key_digest.len() != 64
+                    || !job
+                        .key_digest
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                    || job.action.validate().is_err()
+                    || job.expected_revision > state.revision
+                    || job.updated_at < job.created_at
+                    || (job.status == JobStatus::Succeeded
+                        && (job.result.is_none() || job.error_code.is_some()))
+                    || (job.status == JobStatus::Failed
+                        && (job.result.is_some() || job.error_code.is_none()))
+                    || (matches!(job.status, JobStatus::Queued | JobStatus::Running)
+                        && job.result.is_some())
+                    || job
+                        .result
+                        .as_ref()
+                        .is_some_and(|result| result.revision > state.revision)
+                    || (state.schema < 7
+                        && (matches!(job.action, Action::ExpireArtifacts { .. })
+                            || job
+                                .result
+                                .as_ref()
+                                .and_then(|r| r.retention.as_ref())
+                                .is_some_and(|r| !r.artifacts.is_empty())))
+                    || (state.schema < 6
+                        && (matches!(
+                            job.action,
+                            Action::ExpireRetained { .. } | Action::ExpireArtifacts { .. }
+                        ) || job
+                            .result
+                            .as_ref()
+                            .is_some_and(|result| result.retention.is_some())))
+                    || (job.status == JobStatus::Succeeded
+                        && matches!(
+                            job.action,
+                            Action::ExpireRetained { .. } | Action::ExpireArtifacts { .. }
+                        )
+                        && job
+                            .result
+                            .as_ref()
+                            .is_none_or(|result| result.retention.is_none()))
+                    || (!matches!(
+                        job.action,
+                        Action::ExpireRetained { .. } | Action::ExpireArtifacts { .. }
+                    ) && job
+                        .result
+                        .as_ref()
+                        .is_some_and(|result| result.retention.is_some()))
+                    || job
+                        .result
+                        .as_ref()
+                        .and_then(|r| r.retention.as_ref())
+                        .is_some_and(|receipt| {
+                            if job.status != JobStatus::Succeeded || receipt.reclaimed_bytes != 0 {
+                                return true;
+                            }
+                            match &job.action {
+                                Action::ExpireArtifacts { expired_before } => {
+                                    !receipt.snapshots.is_empty()
+                                        || !receipt.trash.is_empty()
+                                        || receipt.expired_before != *expired_before
+                                        || receipt.artifacts.windows(2).any(|ids| ids[0] >= ids[1])
+                                        || receipt.artifacts.iter().any(|id| {
+                                            state
+                                                .artifacts
+                                                .get(id)
+                                                .and_then(|a| a.retirement.as_ref())
+                                                .is_none_or(|retired| retired.job_id != job.id)
+                                        })
+                                }
+                                Action::ExpireRetained { expired_before } => {
+                                    !receipt.artifacts.is_empty()
+                                        || receipt.expired_before != *expired_before
+                                }
+                                _ => true,
+                            }
+                        })
+                    || (state.schema < 5
+                        && (job.action == Action::Export
+                            || job.result.as_ref().is_some_and(|r| r.artifact_id.is_some())))
                     || (state.schema < 4
                         && (matches!(
                             job.action,
@@ -575,7 +686,8 @@ impl Store {
         {
             return Err(Error::Corrupt);
         }
-        self.validate_artifacts(&state)?;
+        history_audit::validate_history_checkpoint(&state)?;
+        self.validate_artifacts(&state, &jobs)?;
         Ok(state)
     }
     fn save(&self, state: &State) -> Result<()> {
@@ -586,6 +698,7 @@ impl Store {
         // Reclamation failure leaves extra blobs; physical admission limits
         // prevent unbounded growth without misreporting a committed activation.
         let _ = self.collect_blobs(state);
+        let _ = self.collect_retired_artifacts(state);
         Ok(())
     }
 
@@ -637,6 +750,24 @@ impl Store {
             operation.store.load()?,
             operation.store.config.policy.clone(),
             operation.store.policy_revision,
+        ))
+    }
+    /// Inspect one coherent policy, manifest and physical payload observation.
+    /// Physical payload lengths exclude metadata, allocation overhead and backups.
+    pub fn inspect_with_policy_and_usage(
+        &self,
+    ) -> Result<(State, Policy, Option<u64>, StorageObservation)> {
+        let _lease = self.lease()?;
+        let operation = self.serial()?;
+        let current = &operation.store;
+        let state = current.load()?;
+        let observed_at = now();
+        let usage = current.storage_usage_locked(&state, observed_at)?;
+        Ok((
+            state,
+            current.config.policy.clone(),
+            current.policy_revision,
+            StorageObservation { observed_at, usage },
         ))
     }
     fn lookup<'a>(&'a self, view: &'a View, path: &str) -> Option<&'a Entry> {
@@ -907,6 +1038,26 @@ impl Store {
         let path = current.handle_path(&state, handle)?;
         current.delete_locked(&mut state, path, actor)
     }
+    /// Validate delete-pending without publishing a deletion or trash record.
+    /// The protocol adapter must reject nonempty directories before acknowledging
+    /// delete-on-close or a delete disposition; close rechecks actual deletion.
+    pub fn check_delete_handle(&self, handle: &Handle) -> Result<()> {
+        if self.namespace != handle.store.namespace {
+            return Err(Error::Corrupt);
+        }
+        let operation = self.serial()?;
+        let current = &operation.store;
+        let state = current.load()?;
+        if state.generation != handle.generation {
+            return Err(Error::Revision);
+        }
+        let path = current.handle_path(&state, handle)?;
+        let entry = current.lookup(&state.view, &path).ok_or(Error::NotFound)?;
+        if entry.directory && !current.listing(&state.view, &path)?.is_empty() {
+            return Err(Error::NotEmpty);
+        }
+        Ok(())
+    }
     fn delete_locked(&self, state: &mut State, path: String, actor: &str) -> Result<String> {
         if path.is_empty() {
             return Err(Error::Path);
@@ -926,6 +1077,7 @@ impl Store {
             trash_id.clone(),
             Trash {
                 id: trash_id.clone(),
+                generation: Some(state.generation.clone()),
                 path: path.clone(),
                 entry,
                 from_upper,
@@ -1041,7 +1193,11 @@ impl Store {
             .values()
             .try_fold(0u64, |sum, bytes| sum.checked_add(*bytes))
             .ok_or(Error::Quota)?;
-        let retained = retained.checked_add(artifact_bytes).ok_or(Error::Quota)?;
+        let receipt_bytes = self.receipt_physical_bytes()?;
+        let retained = retained
+            .checked_add(artifact_bytes)
+            .and_then(|n| n.checked_add(receipt_bytes))
+            .ok_or(Error::Quota)?;
         if active > policy.active_bytes
             || state.view.upper.len() > policy.active_files
             || retained > policy.retained_bytes
