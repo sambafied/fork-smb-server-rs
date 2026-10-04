@@ -13,6 +13,7 @@ mod backup_jobs;
 mod export;
 mod management;
 mod policy_catalog;
+mod retention;
 pub use backup_jobs::BackupCatalog;
 pub use export::{ExportManifest, ExportPreflight, ExportSummary};
 pub use management::{Action, ActionImpact, Job, JobResult, JobStatus, RequestBinding, Submission};
@@ -20,6 +21,7 @@ pub use policy_catalog::{
     PolicyAuditBatch, PolicyChange, PolicyCheckpoint, PolicyDocument, PolicyRead,
     SharePolicyCatalog,
 };
+pub use retention::{ExpiryPreview, ExpiryResult, RetentionJobResult, StorageUsage};
 
 use atomic_write_file::AtomicWriteFile;
 use serde::{Deserialize, Serialize};
@@ -95,7 +97,8 @@ pub struct Policy {
 }
 
 impl Policy {
-    fn validate(&self) -> Result<()> {
+    /// Validate a full replacement before attempting publication.
+    pub fn validate(&self) -> Result<()> {
         if let Some(artifacts) = &self.artifacts {
             artifacts.validate(self.retained_bytes)?;
         }
@@ -551,12 +554,29 @@ impl Store {
     fn load(&self) -> Result<State> {
         let state: State =
             serde_json::from_slice(&bounded_read(&self.state_path(), 16 * 1024 * 1024)?)?;
-        if !matches!(state.schema, 1..=5)
+        if !matches!(state.schema, 1..=6)
             || (state.schema == 1 && !state.jobs.is_empty())
             || state.jobs.values().any(|job| {
-                (state.schema < 5
-                    && (job.action == Action::Export
-                        || job.result.as_ref().is_some_and(|r| r.artifact_id.is_some())))
+                (state.schema < 6
+                    && (matches!(job.action, Action::ExpireRetained { .. })
+                        || job
+                            .result
+                            .as_ref()
+                            .is_some_and(|result| result.retention.is_some())))
+                    || (job.status == JobStatus::Succeeded
+                        && matches!(job.action, Action::ExpireRetained { .. })
+                        && job
+                            .result
+                            .as_ref()
+                            .is_none_or(|result| result.retention.is_none()))
+                    || (!matches!(job.action, Action::ExpireRetained { .. })
+                        && job
+                            .result
+                            .as_ref()
+                            .is_some_and(|result| result.retention.is_some()))
+                    || (state.schema < 5
+                        && (job.action == Action::Export
+                            || job.result.as_ref().is_some_and(|r| r.artifact_id.is_some())))
                     || (state.schema < 4
                         && (matches!(
                             job.action,

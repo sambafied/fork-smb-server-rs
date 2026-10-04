@@ -49,6 +49,14 @@ impl Store {
         action: &Action,
         job: Option<&str>,
     ) -> Result<String> {
+        let mut normalized;
+        let state = if matches!(action, Action::ExpireRetained { .. }) {
+            normalized = state.clone();
+            normalized.schema = 6;
+            &normalized
+        } else {
+            state
+        };
         let external = match action {
             Action::RestoreBackup {
                 destination_id,
