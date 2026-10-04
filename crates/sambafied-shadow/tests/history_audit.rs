@@ -276,6 +276,47 @@ fn subsequent_expiry_actions_preserve_checkpoint_schema_and_replay_authority() {
     }
 }
 
+#[test]
+fn legacy_trash_generation_is_retained_before_its_delete_event_is_archived() {
+    let lab = Lab::new();
+    let store = lab.open();
+    let generation = store.inspect().unwrap().generation;
+    let trash = store.delete("BASE.DAT", "alice").unwrap();
+    assert_eq!(
+        store.inspect().unwrap().trash[&trash].generation.as_deref(),
+        Some(generation.as_str())
+    );
+    // Simulate the old supported record shape; the pending audit contains truth.
+    rewrite(&store, |state| {
+        state.trash.get_mut(&trash).unwrap().generation = None
+    });
+    let before = store.inspect().unwrap();
+    let batch = store.history_audit_batch().unwrap();
+    store
+        .acknowledge_history(&batch.fingerprint().unwrap(), batch.revision, "operator")
+        .unwrap();
+    let after = lab.open().inspect().unwrap();
+    assert!(after.history.is_empty());
+    assert_eq!(
+        after.trash[&trash].generation.as_deref(),
+        Some(generation.as_str())
+    );
+    assert_eq!(
+        after.trash[&trash].expires_at,
+        before.trash[&trash].expires_at
+    );
+    assert_eq!(after.trash[&trash].path, before.trash[&trash].path);
+    assert_eq!(
+        serde_json::to_value(&after.view).unwrap(),
+        serde_json::to_value(&before.view).unwrap()
+    );
+    assert!(after.view.whiteouts.contains(&after.trash[&trash].path));
+    assert_eq!(
+        fs::read(lab.config.base.join("BASE.DAT")).unwrap(),
+        b"immutable"
+    );
+}
+
 #[cfg(windows)]
 #[test]
 fn blocked_publication_keeps_complete_outbox_and_retry_commits_once() {

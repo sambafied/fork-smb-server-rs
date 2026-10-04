@@ -159,6 +159,20 @@ impl Store {
                 .map(|value| serde_json::to_vec(value).map(|bytes| digest(&bytes)))
                 .transpose()?,
         };
+        // Trash display provenance used to depend on the pending delete event.
+        // Retain known provenance before removing the acknowledged source events.
+        for trash in state.trash.values_mut() {
+            if trash.generation.is_none() {
+                trash.generation = state
+                    .history
+                    .iter()
+                    .find(|event| {
+                        event.operation == "delete"
+                            && event.object_id.as_deref() == Some(trash.id.as_str())
+                    })
+                    .map(|event| event.generation.clone());
+            }
+        }
         state.schema = 8;
         state.revision = committed_revision;
         state.history.clear();

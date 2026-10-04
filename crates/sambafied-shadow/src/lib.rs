@@ -193,6 +193,8 @@ pub struct Snapshot {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Trash {
     pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<String>,
     pub path: String,
     pub entry: Entry,
     pub from_upper: bool,
@@ -1022,6 +1024,7 @@ impl Store {
             trash_id.clone(),
             Trash {
                 id: trash_id.clone(),
+                generation: Some(state.generation.clone()),
                 path: path.clone(),
                 entry,
                 from_upper,
