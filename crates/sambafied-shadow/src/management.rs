@@ -484,7 +484,7 @@ impl Store {
                 return Err(Error::Busy);
             }
             state.schema = if matches!(action, Action::ExpireArtifacts { .. }) {
-                7
+                state.schema.max(7)
             } else {
                 state.schema.max(6)
             };

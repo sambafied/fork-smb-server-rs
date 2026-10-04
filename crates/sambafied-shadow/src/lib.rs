@@ -6,6 +6,9 @@
 //! counterpart. The lease works across the API and SMB engine processes.
 #![forbid(unsafe_code)]
 
+mod history_audit;
+pub use history_audit::{HistoryAcknowledgement, HistoryAuditBatch, HistoryCheckpoint};
+
 mod artifacts;
 pub use artifacts::{ArtifactPolicy, ArtifactRetirement, ExportArtifact};
 
@@ -198,6 +201,7 @@ pub struct Trash {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Event {
     pub sequence: u64,
     pub revision: u64,
@@ -225,6 +229,8 @@ pub struct State {
     #[serde(default)]
     pub backups: BTreeMap<String, Backup>,
     pub history: Vec<Event>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_checkpoint: Option<HistoryCheckpoint>,
     #[serde(default)]
     pub jobs: BTreeMap<String, Job>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -506,6 +512,7 @@ impl Store {
                 trash: BTreeMap::new(),
                 backups: BTreeMap::new(),
                 history: Vec::new(),
+                history_checkpoint: None,
                 jobs: BTreeMap::new(),
                 artifacts: BTreeMap::new(),
             })?;
@@ -557,7 +564,7 @@ impl Store {
     fn load(&self) -> Result<State> {
         let state: State =
             serde_json::from_slice(&bounded_read(&self.state_path(), 16 * 1024 * 1024)?)?;
-        if !matches!(state.schema, 1..=7)
+        if !matches!(state.schema, 1..=8)
             || (state.schema == 1 && !state.jobs.is_empty())
             || state.jobs.values().any(|job| {
                 (state.schema < 7
@@ -644,6 +651,7 @@ impl Store {
         {
             return Err(Error::Corrupt);
         }
+        history_audit::validate_history_checkpoint(&state)?;
         self.validate_artifacts(&state)?;
         Ok(state)
     }
