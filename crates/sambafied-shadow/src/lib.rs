@@ -6,6 +6,12 @@
 //! counterpart. The lease works across the API and SMB engine processes.
 #![forbid(unsafe_code)]
 
+mod receipt_archive;
+pub use receipt_archive::{
+    ReceiptArchival, ReceiptArchiveBatch, ReceiptArchiveCheckpoint, ReceiptArchivePreview,
+    ReceiptArchiveReference,
+};
+
 mod history_audit;
 pub use history_audit::{HistoryAcknowledgement, HistoryAuditBatch, HistoryCheckpoint};
 
@@ -235,6 +241,8 @@ pub struct State {
     pub history_checkpoint: Option<HistoryCheckpoint>,
     #[serde(default)]
     pub jobs: BTreeMap<String, Job>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt_archive: Option<ReceiptArchiveReference>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub artifacts: BTreeMap<String, ExportArtifact>,
 }
@@ -516,6 +524,7 @@ impl Store {
                 history: Vec::new(),
                 history_checkpoint: None,
                 jobs: BTreeMap::new(),
+                receipt_archive: None,
                 artifacts: BTreeMap::new(),
             })?;
         }
@@ -566,16 +575,40 @@ impl Store {
     fn load(&self) -> Result<State> {
         let state: State =
             serde_json::from_slice(&bounded_read(&self.state_path(), 16 * 1024 * 1024)?)?;
-        if !matches!(state.schema, 1..=8)
+        let jobs = self.receipt_jobs(&state)?;
+        if !matches!(state.schema, 1..=9)
             || (state.schema == 1 && !state.jobs.is_empty())
-            || state.jobs.values().any(|job| {
-                (state.schema < 7
-                    && (matches!(job.action, Action::ExpireArtifacts { .. })
-                        || job
-                            .result
-                            .as_ref()
-                            .and_then(|r| r.retention.as_ref())
-                            .is_some_and(|r| !r.artifacts.is_empty())))
+            || jobs.iter().any(|(id, job)| {
+                Uuid::parse_str(id).map_or(true, |parsed| parsed.to_string() != *id)
+                    || job.id != *id
+                    || job.actor.is_empty()
+                    || job.actor.len() > 256
+                    || job.actor.chars().any(char::is_control)
+                    || job.key_digest.len() != 64
+                    || !job
+                        .key_digest
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                    || job.action.validate().is_err()
+                    || job.expected_revision > state.revision
+                    || job.updated_at < job.created_at
+                    || (job.status == JobStatus::Succeeded
+                        && (job.result.is_none() || job.error_code.is_some()))
+                    || (job.status == JobStatus::Failed
+                        && (job.result.is_some() || job.error_code.is_none()))
+                    || (matches!(job.status, JobStatus::Queued | JobStatus::Running)
+                        && job.result.is_some())
+                    || job
+                        .result
+                        .as_ref()
+                        .is_some_and(|result| result.revision > state.revision)
+                    || (state.schema < 7
+                        && (matches!(job.action, Action::ExpireArtifacts { .. })
+                            || job
+                                .result
+                                .as_ref()
+                                .and_then(|r| r.retention.as_ref())
+                                .is_some_and(|r| !r.artifacts.is_empty())))
                     || (state.schema < 6
                         && (matches!(
                             job.action,
@@ -654,7 +687,7 @@ impl Store {
             return Err(Error::Corrupt);
         }
         history_audit::validate_history_checkpoint(&state)?;
-        self.validate_artifacts(&state)?;
+        self.validate_artifacts(&state, &jobs)?;
         Ok(state)
     }
     fn save(&self, state: &State) -> Result<()> {
@@ -1140,7 +1173,11 @@ impl Store {
             .values()
             .try_fold(0u64, |sum, bytes| sum.checked_add(*bytes))
             .ok_or(Error::Quota)?;
-        let retained = retained.checked_add(artifact_bytes).ok_or(Error::Quota)?;
+        let receipt_bytes = self.receipt_physical_bytes()?;
+        let retained = retained
+            .checked_add(artifact_bytes)
+            .and_then(|n| n.checked_add(receipt_bytes))
+            .ok_or(Error::Quota)?;
         if active > policy.active_bytes
             || state.view.upper.len() > policy.active_files
             || retained > policy.retained_bytes

@@ -138,7 +138,7 @@ pub struct ActionImpact {
 }
 
 impl Action {
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         if let Self::ExpireRetained { expired_before } | Self::ExpireArtifacts { expired_before } =
             self
         {
@@ -436,8 +436,8 @@ impl Store {
         let current = &_serial.store;
         let mut state = current.load()?;
         let key_digest = digest(key.as_bytes());
-        if let Some(job) = state
-            .jobs
+        let jobs = current.receipt_jobs(&state)?;
+        if let Some(job) = jobs
             .values()
             .find(|j| j.actor == actor && j.key_digest == key_digest)
         {
@@ -535,8 +535,8 @@ impl Store {
         let current = &_serial.store;
         let state = current.load()?;
         let key_digest = digest(key.as_bytes());
-        let Some(job) = state
-            .jobs
+        let jobs = current.receipt_jobs(&state)?;
+        let Some(job) = jobs
             .values()
             .find(|job| job.actor == actor && job.key_digest == key_digest)
         else {
@@ -560,9 +560,9 @@ impl Store {
         let _lease = self.lease()?;
         let _serial = self.serial()?;
         let current = &_serial.store;
+        let state = current.load()?;
         current
-            .load()?
-            .jobs
+            .receipt_jobs(&state)?
             .get(job_id)
             .filter(|j| j.actor == actor)
             .cloned()
@@ -593,8 +593,8 @@ impl Store {
         let _serial = self.serial()?;
         let current = &_serial.store;
         let mut original = current.load()?;
-        let mut job = original
-            .jobs
+        let mut job = current
+            .receipt_jobs(&original)?
             .get(job_id)
             .filter(|j| j.actor == actor)
             .cloned()

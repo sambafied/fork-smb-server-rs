@@ -68,7 +68,7 @@ pub(crate) fn validate_history_checkpoint(state: &State) -> Result<()> {
             Ok(())
         };
     };
-    if state.schema != 8
+    if !matches!(state.schema, 8..=9)
         || checkpoint.source_revision.checked_add(1) != Some(checkpoint.committed_revision)
         || checkpoint.committed_revision > state.revision
         || !valid_actor(&checkpoint.actor)
@@ -173,7 +173,7 @@ impl Store {
                     .map(|event| event.generation.clone());
             }
         }
-        state.schema = 8;
+        state.schema = state.schema.max(8);
         state.revision = committed_revision;
         state.history.clear();
         state.history_checkpoint = Some(checkpoint.clone());

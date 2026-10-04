@@ -18,6 +18,10 @@ pub struct StorageUsage {
     pub retained_bytes: u64,
     /// Admission accounting additionally charges unpublished/orphan archives.
     pub retained_charged_bytes: u64,
+    pub receipt_archive_bytes: u64,
+    pub receipt_physical_bytes: u64,
+    pub receipt_orphan_bytes: u64,
+    pub archived_job_count: u64,
     pub expired_snapshot_count: usize,
     pub expired_trash_count: usize,
     pub expired_artifact_count: usize,
@@ -108,6 +112,12 @@ impl Store {
                         .map(|artifact| artifact.bytes),
                 ),
         )?;
+        let receipt_archive_bytes = state.receipt_archive.as_ref().map_or(0, |r| r.total_bytes);
+        let receipt_physical_bytes = self.receipt_physical_bytes()?;
+        let retained_bytes = retained_bytes
+            .checked_add(receipt_archive_bytes)
+            .ok_or(Error::Quota)?;
+        let receipt_orphan_bytes = receipt_physical_bytes.saturating_sub(receipt_archive_bytes);
         let referenced: BTreeSet<_> = state
             .view
             .upper
@@ -165,8 +175,13 @@ impl Store {
         let retained_charged_bytes = retained_bytes
             .checked_sub(registered_artifacts)
             .and_then(|n| n.checked_add(charged_artifacts))
+            .and_then(|n| n.checked_add(receipt_orphan_bytes))
             .ok_or(Error::Quota)?;
         Ok(StorageUsage {
+            receipt_archive_bytes,
+            receipt_physical_bytes,
+            receipt_orphan_bytes,
+            archived_job_count: state.receipt_archive.as_ref().map_or(0, |r| r.total_jobs),
             active_bytes,
             active_files: state.view.upper.len(),
             retained_bytes,

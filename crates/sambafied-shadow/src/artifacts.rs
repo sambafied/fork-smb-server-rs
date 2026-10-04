@@ -117,7 +117,11 @@ impl Store {
         }
         Ok(physical)
     }
-    pub(crate) fn validate_artifacts(&self, state: &State) -> Result<()> {
+    pub(crate) fn validate_artifacts(
+        &self,
+        state: &State,
+        jobs: &BTreeMap<String, Job>,
+    ) -> Result<()> {
         if state.schema < 5 && !state.artifacts.is_empty() {
             return Err(Error::Corrupt);
         }
@@ -138,7 +142,7 @@ impl Store {
                 return Err(Error::Corrupt);
             }
             if let Some(retirement) = &artifact.retirement {
-                let job = state.jobs.get(&retirement.job_id).ok_or(Error::Corrupt)?;
+                let job = jobs.get(&retirement.job_id).ok_or(Error::Corrupt)?;
                 let result = job.result.as_ref().ok_or(Error::Corrupt)?;
                 let receipt = result.retention.as_ref().ok_or(Error::Corrupt)?;
                 if state.schema < 7
@@ -158,7 +162,7 @@ impl Store {
                     return Err(Error::Corrupt);
                 }
             }
-            let job = state.jobs.get(id).ok_or(Error::Corrupt)?;
+            let job = jobs.get(id).ok_or(Error::Corrupt)?;
             if job.status != JobStatus::Succeeded
                 || job.action != Action::Export
                 || job.actor != artifact.actor
@@ -173,8 +177,7 @@ impl Store {
                 return Err(Error::Corrupt);
             }
         }
-        for job in state
-            .jobs
+        for job in jobs
             .values()
             .filter(|j| j.action == Action::Export && j.status == JobStatus::Succeeded)
         {
